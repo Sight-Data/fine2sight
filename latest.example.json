@@ -1,0 +1,6 @@
+{
+  "_说明": "把这个文件改好后放到官网 version.py:UPDATE_CHECK_URLS 指向的地址(优先 https://sightdata.top/finereport-converter/latest.json,兜底 https://sight-report.top/...)。工具每次启动会拉取它,version 比本地新就提示升级。",
+  "version": "1.0.0",
+  "url": "https://sightdata.top/downloads",
+  "notes": "首个版本"
+}

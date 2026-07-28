@@ -1,0 +1,6 @@
+# 运行所需(核心转换器是纯标准库,GUI 只多这一个依赖)
+pywebview>=5.0
+
+# mac 若提示缺 WebKit 后端:pip install pyobjc-framework-WebKit
+# Windows 需要系统已装 "WebView2 Runtime"(Win11/多数 Win10 自带)
+# 打包另需 pyinstaller(见 build_*.sh / build_*.bat,脚本会自动装)

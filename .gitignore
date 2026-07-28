@@ -1,0 +1,35 @@
+# 转换产物 / 临时输出,不入库
+sample-out/
+out/
+*.mrg
+*.report.md
+_summary.md
+config.json
+__pycache__/
+*.pyc
+
+# 桌面应用打包产物(PyInstaller)
+desktop/build/
+desktop/dist/
+desktop/*.spec
+desktop/magic-reports.zip
+
+# 构建戳(每次编译生成,勿入库;version.py 的 __version__ 才是入库的语义版本)
+_build.py
+
+# 虚拟环境 / 系统杂项 / 编辑器
+.venv/
+venv/
+.DS_Store
+.idea/
+.vscode/
+
+# 远程打包产物落地目录
+release/
+
+# 云盘同步冲突产生的临时文件 / 待清理项
+_to_delete/
+
+# 一次性推送脚本(仅本机用,不入库)
+/push-fine2sight.sh
+/push-fine2sight.command

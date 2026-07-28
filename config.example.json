@@ -1,0 +1,25 @@
+{
+  "_说明": "复制本文件为 config.json 并按需修改;运行时用 -c config.json 指定。所有键都可选,缺省走内置默认。",
+
+  "connection_map": {
+    "_说明": "帆软数据库连接名(.cpt 里 <Connection><DatabaseName> 的值)→ sight-report 数据连接名称。键=帆软连接名,值=Sight Report 里的数据连接名称(字符串)。运行时按名称解析数据源,无需 id。配齐后 SQL 数据集会直接绑定,无需导入后再手工选。",
+    "DFHIS": "门诊住院HIS库",
+    "DFZHUSHUJU": "主数据库"
+  },
+
+  "length_divisor": 24130,
+  "_length_divisor说明": "帆软行高/列宽内部单位 ÷ 该值 = Sight Report 像素。723900÷24130=30(默认行高)。若导入后行列尺寸明显偏大/偏小,调这个数。",
+
+  "font_size_divisor": 6,
+  "_font_size_divisor说明": "帆软字号 ÷ 该值 = Sight Report pt。默认 6 时 72→12 / 84→14 / 108→18。若导入后字偏大改大此值,偏小改小。",
+  "font_size_min": 9,
+  "font_size_max": 28,
+
+  "default_font_family": "微软雅黑",
+
+  "font_name_map": {
+    "_说明": "帆软字体名(小写)→ 中文字体名。可按贵院字体补充。",
+    "simhei": "黑体",
+    "simsun": "宋体"
+  }
+}

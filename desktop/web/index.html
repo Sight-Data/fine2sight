@@ -1,0 +1,382 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>帆软报表转换器</title>
+<style>
+  :root{
+    --bg:#f5f6f8; --card:#fff; --line:#e3e6ea; --ink:#1f2329; --sub:#6b7280;
+    --primary:#3b6ef5; --primary-d:#2f59c9; --ok:#1a9e57; --warn:#c77700; --bad:#d23f3f;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;font:14px/1.55 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif;
+       background:var(--bg);color:var(--ink)}
+  .wrap{max-width:920px;margin:0 auto;padding:18px 20px 40px}
+  h1{font-size:18px;margin:4px 0 2px}
+  .hint{color:var(--sub);font-size:12.5px;margin:0 0 16px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:10px;
+        padding:14px 16px;margin-bottom:14px}
+  .card h2{font-size:14px;margin:0 0 10px;display:flex;align-items:center;gap:8px}
+  .card h2 .n{width:20px;height:20px;border-radius:50%;background:var(--primary);color:#fff;
+        font-size:12px;display:inline-flex;align-items:center;justify-content:center}
+  button{font:inherit;border:1px solid var(--line);background:#fff;color:var(--ink);
+        padding:6px 12px;border-radius:7px;cursor:pointer}
+  button:hover{border-color:#c4c9d0}
+  button.primary{background:var(--primary);border-color:var(--primary);color:#fff}
+  button.primary:hover{background:var(--primary-d)}
+  button:disabled{opacity:.5;cursor:not-allowed}
+  .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+  .chips{margin-top:10px;display:flex;flex-direction:column;gap:6px}
+  .chip{display:flex;align-items:center;gap:8px;background:#f1f3f6;border-radius:6px;
+        padding:5px 8px;font-size:12.5px}
+  .chip .path{flex:1;word-break:break-all;color:#374151}
+  .chip .tag{font-size:11px;color:#fff;background:#8a93a3;border-radius:4px;padding:1px 6px}
+  .chip .tag.dir{background:#5a87e0}
+  .chip .x{cursor:pointer;color:#9aa1ab;font-weight:bold;padding:0 4px}
+  .chip .x:hover{color:var(--bad)}
+  .pathbox{flex:1;min-width:0;background:#f1f3f6;border-radius:6px;padding:6px 9px;
+        font-size:12.5px;color:#374151;word-break:break-all}
+  table{width:100%;border-collapse:collapse;font-size:12.5px}
+  th,td{text-align:left;padding:6px 8px;border-bottom:1px solid var(--line);vertical-align:middle}
+  th{color:var(--sub);font-weight:600}
+  td input{width:100%;border:1px solid var(--line);border-radius:5px;padding:4px 6px;font:inherit}
+  .opts label{display:inline-flex;align-items:center;gap:5px;margin-right:18px;cursor:pointer}
+  .foot{display:flex;align-items:center;gap:14px;margin-top:6px}
+  .prog{flex:1;height:8px;background:#e9ecf1;border-radius:5px;overflow:hidden;display:none}
+  .prog>i{display:block;height:100%;width:0;background:var(--primary);transition:width .15s}
+  .sum{font-size:13px;margin:2px 0 10px}
+  .b-ok{color:var(--ok)} .b-warn{color:var(--warn)} .b-bad{color:var(--bad)} .b-skip{color:var(--sub)}
+  .muted{color:var(--sub)}
+  a.link{color:var(--primary);cursor:pointer;text-decoration:none}
+  a.link:hover{text-decoration:underline}
+  .empty{color:var(--sub);font-size:12.5px;padding:6px 0}
+  .badge{display:inline-block;min-width:18px;text-align:center;border-radius:4px;
+        padding:0 5px;font-size:11.5px}
+  .badge.m{background:#fdebd0;color:#9a5b00}
+  .badge.d{background:#fbe2e2;color:#a52727}
+  .badge.z{background:#e7eaef;color:#7a828d}
+  .modal-mask{position:fixed;inset:0;background:rgba(20,24,31,.42);display:none;
+        align-items:center;justify-content:center;z-index:50}
+  .modal{background:#fff;border-radius:12px;max-width:520px;width:88%;
+        box-shadow:0 12px 40px rgba(0,0,0,.22);padding:18px 20px}
+  .modal h3{margin:0 0 8px;font-size:15px;display:flex;align-items:center;gap:8px}
+  .modal .conns{background:#fff7e6;border:1px solid #ffd591;border-radius:8px;
+        padding:8px 10px;margin:10px 0;max-height:180px;overflow:auto;
+        font-size:13px;color:#6b4b00;line-height:1.7}
+  .modal .acts{display:flex;justify-content:flex-end;gap:10px;margin-top:14px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>帆软报表 → sight-report 转换器</h1>
+  <p class="hint">把帆软 <code>.cpt</code> 网格报表批量转换为 sight-report 可导入的 <code>.mrg</code>。
+     选择文件或文件夹(文件夹会递归),映射数据源,设置输出后开始。</p>
+
+  <!-- 升级提示(检测到新版本时显示) -->
+  <div id="updBanner" style="display:none;margin:0 0 14px;padding:10px 14px;border-radius:8px;
+       background:#fff7e6;border:1px solid #ffd591;color:#874d00;font-size:13px;
+       align-items:center;gap:12px">
+    <span id="updText" style="flex:1"></span>
+    <button id="updBtn" style="white-space:nowrap">前往升级</button>
+    <span id="updClose" style="cursor:pointer;opacity:.6;padding:0 4px">×</span>
+  </div>
+
+  <!-- 1 输入 -->
+  <div class="card">
+    <h2><span class="n">1</span>输入(帆软 .cpt 文件或文件夹)</h2>
+    <div class="row">
+      <button id="addFiles">+ 添加文件</button>
+      <button id="addFolder">+ 添加文件夹</button>
+      <span class="muted" id="inputCount"></span>
+    </div>
+    <div class="chips" id="inputs"></div>
+  </div>
+
+  <!-- 2 输出 -->
+  <div class="card">
+    <h2><span class="n">2</span>输出目录</h2>
+    <div class="row">
+      <button id="pickOut">选择输出目录</button>
+      <span class="pathbox" id="outPath">未选择</span>
+    </div>
+  </div>
+
+  <!-- 3 数据源映射 -->
+  <div class="card">
+    <h2><span class="n">3</span>数据源映射 <span class="muted" style="font-weight:400;font-size:12px">(帆软连接名 → 数据连接名称)</span></h2>
+    <div class="row">
+      <button id="scan">扫描连接名</button>
+      <span class="muted" id="scanHint">先添加输入,再扫描。未填写的连接转换后会标「待人工」。</span>
+    </div>
+    <table id="connTable" style="margin-top:10px;display:none">
+      <thead><tr><th style="width:45%">帆软连接名</th><th>数据连接名称</th></tr></thead>
+      <tbody id="connBody"></tbody>
+    </table>
+  </div>
+
+  <!-- 4 选项 -->
+  <div class="card">
+    <h2><span class="n">4</span>选项</h2>
+    <div class="opts row">
+      <span class="muted">同名已存在:</span>
+      <label><input type="radio" name="ow" value="overwrite" checked>覆盖</label>
+      <label><input type="radio" name="ow" value="skip">跳过</label>
+      <label><input type="radio" name="ow" value="rename">自动重命名</label>
+      <label style="margin-left:14px"><input type="checkbox" id="zip">同时打包 .zip(供批量导入)</label>
+    </div>
+    <div class="opts row" style="margin-top:8px">
+      <label><input type="checkbox" id="mergeSheets" checked>多 sheet 的 .cpt 合并为单个多页签报表</label>
+      <span class="muted" style="font-size:12px">不勾选则每个 sheet 拆成一张独立报表(旧行为);单 sheet 报表不受影响。</span>
+    </div>
+  </div>
+
+  <!-- 运行 -->
+  <div class="card">
+    <div class="foot">
+      <button class="primary" id="run" disabled>开始转换</button>
+      <div class="prog" id="prog"><i id="progBar"></i></div>
+      <span class="muted" id="progText"></span>
+    </div>
+    <div id="result" style="margin-top:12px"></div>
+  </div>
+
+  <!-- 版本号 -->
+  <div class="verbar" style="text-align:right;margin-top:10px;color:#9aa0a6;font-size:12px">
+    版本 <span id="verText">…</span>
+  </div>
+</div>
+
+<!-- 数据连接未映射提醒(应用内确认框) -->
+<div class="modal-mask" id="connMask">
+  <div class="modal">
+    <h3>⚠️ 有数据连接尚未映射</h3>
+    <div class="muted" style="font-size:12.5px">以下帆软连接还没有填写对应的「数据连接名称」。未映射的连接转换后
+      <b>数据源留空</b>,导入设计器还需手工选;每个连接在上方「数据源映射」里填一次即可解决它的全部报表。</div>
+    <div class="conns" id="connMaskList"></div>
+    <div class="acts">
+      <button id="connMapBtn">去映射填写</button>
+      <button class="primary" id="connGoBtn">仍然继续转换</button>
+    </div>
+  </div>
+</div>
+
+<script>
+const state = { inputs: [], outdir: "", conns: [] };
+let apiReady = false;
+
+function api(){ return window.pywebview && window.pywebview.api; }
+function el(id){ return document.getElementById(id); }
+function esc(s){ return (s==null?"":String(s)).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
+
+function renderInputs(){
+  const box = el("inputs"); box.innerHTML = "";
+  state.inputs.forEach((it,i)=>{
+    const d = document.createElement("div"); d.className="chip";
+    d.innerHTML = `<span class="tag ${it.dir?'dir':''}">${it.dir?'文件夹':'文件'}</span>`
+      + `<span class="path">${esc(it.path)}</span><span class="x" data-i="${i}">×</span>`;
+    box.appendChild(d);
+  });
+  box.querySelectorAll(".x").forEach(x=>x.onclick=()=>{ state.inputs.splice(+x.dataset.i,1); renderInputs(); refresh(); });
+  el("inputCount").textContent = state.inputs.length ? `共 ${state.inputs.length} 项` : "";
+  refresh();
+}
+
+function addInputs(paths, dir){
+  (paths||[]).forEach(p=>{ if(p && !state.inputs.some(x=>x.path===p)) state.inputs.push({path:p,dir:!!dir}); });
+  renderInputs();
+}
+
+function refresh(){
+  el("run").disabled = !(state.inputs.length && state.outdir);
+}
+
+function connMap(){
+  const m = {};
+  el("connBody") && el("connBody").querySelectorAll("tr").forEach(tr=>{
+    const name = tr.dataset.name;
+    const dn = tr.querySelector(".cname").value.trim();
+    if(dn) m[name] = dn;   // 值=数据连接名称(运行时按名称解析数据源,无需 id)
+  });
+  return m;
+}
+
+window.onProgress = function(done,total,name){
+  el("progBar").style.width = total? Math.round(done/total*100)+"%" : "0";
+  el("progText").textContent = `转换中 ${done}/${total} — ${name||""}`;
+};
+
+function statusCell(r){
+  if(!r.ok) return `<span class="b-bad">✗ ${esc(r.error||"失败")}</span>`;
+  if(r.skipped) return `<span class="b-skip">⏭ 跳过</span>`;
+  return `<span class="b-ok">✓</span>`;
+}
+
+function renderResult(res){
+  const r = el("result");
+  if(!res || !res.results || !res.results.length){ r.innerHTML = `<div class="empty">没有可转换的 .cpt。</div>`; return; }
+  const parts = [];
+  parts.push(`<div class="sum">完成:<b class="b-ok">${res.ok}</b> 成功`
+    + (res.skipped?` · <b class="b-skip">${res.skipped}</b> 跳过`:"")
+    + (res.failed?` · <b class="b-bad">${res.failed}</b> 失败`:"")
+    + ` <span class="muted">(输入 ${res.files} 文件 → ${res.reports} 张报表)</span></div>`);
+  if(res.unmapped && res.unmapped.length)
+    parts.push(`<div class="sum b-warn">⚠ 未映射数据源:${res.unmapped.map(esc).join("、")} — 这些报表导入后需在设计器选数据源</div>`);
+  if(res.zip) parts.push(`<div class="sum">📦 已打包:<a class="link" data-open="${esc(res.zip)}">${esc(res.zip)}</a></div>`);
+
+  // 待处理问题汇总(按类型 + 数据源按连接聚合 + 打开 txt/csv)
+  if(res.issues && res.issues.count){
+    const it = res.issues;
+    let h = `<div class="card" style="margin-top:12px;background:#fafafa">`;
+    h += `<div class="sum">📋 待处理问题汇总(共 <b>${it.count}</b> 条)`;
+    if(it.txt) h += ` · <a class="link" data-open="${esc(it.txt)}">查看清单 _issues.txt</a>`;
+    if(it.csv) h += ` · <a class="link" data-open="${esc(it.csv)}">_issues.csv(Excel)</a>`;
+    h += `</div>`;
+    h += `<table style="margin-top:8px"><thead><tr><th>问题类型</th><th>级别</th><th>数量</th></tr></thead><tbody>`;
+    (it.by_type||[]).forEach(t=>{ h += `<tr><td>${esc(t.type)}</td><td>${t.level==="manual"?"待人工":"降级"}</td><td>${t.count}</td></tr>`; });
+    h += `</tbody></table>`;
+    if(it.assumed_highlights){
+      h += `<div class="sum" style="margin-top:8px;color:#0a7">✓ 已自动转换 · 建议抽查:<b>${it.assumed_highlights}</b> 处条件高亮(结构化条件)按推定运算符语义(=/≠/&gt;/≥/&lt;/≤)自动转换 — 数据不受影响,仅颜色方向建议抽查。</div>`;
+    }
+    if(it.datasource_conns && it.datasource_conns.length){
+      h += `<div class="sum b-warn" style="margin-top:8px">⚙ 数据源待映射(每个连接在上方「数据源映射」里映射一次即可解决其全部报表):</div>`;
+      h += `<ul style="margin:4px 0 0 18px;font-size:13px">`;
+      it.datasource_conns.forEach(c=>{ h += `<li>连接「${esc(c.conn)}」 — ${c.reports} 张报表用到</li>`; });
+      h += `</ul>`;
+    }
+    h += `</div>`;
+    parts.push(h);
+  }
+
+  parts.push(`<table><thead><tr><th>报表</th><th>单元格</th><th>待人工</th><th>降级</th><th>状态</th><th>报告</th></tr></thead><tbody>`);
+  res.results.forEach((x,idx)=>{
+    const has = x.issues && x.issues.length;
+    const mb = x.manual?`<span class="badge m" ${has?`data-detail="${idx}" style="cursor:pointer" title="点击展开"`:""}>${x.manual}</span>`:(x.ok&&!x.skipped?"0":"-");
+    const db = x.degraded?`<span class="badge d" ${has?`data-detail="${idx}" style="cursor:pointer" title="点击展开"`:""}>${x.degraded}</span>`:(x.ok&&!x.skipped?"0":"-");
+    parts.push(`<tr><td>${esc(x.name)}${x.sheets?` <span class="badge z" title="多页签报表">${x.sheets} 页签</span>`:""}</td>`
+      + `<td>${x.ok&&!x.skipped?x.cells:"-"}</td>`
+      + `<td>${mb}</td><td>${db}</td>`
+      + `<td>${statusCell(x)}</td>`
+      + `<td>${x.source?`<a class="link" data-openparent="${esc(x.source)}">源</a>`:""}</td></tr>`);
+    if(has){
+      const lis = x.issues.map(i=>`<div>[${i.level==="manual"?"待人工":"降级"}] <code>${esc(i.where)}</code> — ${esc(i.msg)}</div>`).join("");
+      parts.push(`<tr class="idet" id="idet${idx}" style="display:none"><td colspan="6" style="background:#fafafa;font-size:12px;color:#555;line-height:1.7">${lis}</td></tr>`);
+    }
+  });
+  parts.push(`</tbody></table>`);
+  parts.push(`<div class="row" style="margin-top:10px"><button data-open="${esc(state.outdir)}">打开输出目录</button></div>`);
+  r.innerHTML = parts.join("");
+  r.querySelectorAll("[data-open]").forEach(a=>a.onclick=()=>api()&&api().open_path(a.dataset.open));
+  r.querySelectorAll("[data-openparent]").forEach(a=>a.onclick=()=>api()&&api().open_parent(a.dataset.openparent));
+  r.querySelectorAll("[data-detail]").forEach(a=>a.onclick=()=>{ const d=el("idet"+a.dataset.detail); if(d) d.style.display = d.style.display==="none"?"":"none"; });
+}
+
+// 事件绑定
+el("addFiles").onclick = async()=>{ if(!api())return; addInputs(await api().pick_files(), false); };
+el("addFolder").onclick = async()=>{ if(!api())return; const p=await api().pick_folder(); if(p) addInputs([p], true); };
+el("pickOut").onclick = async()=>{ if(!api())return; const p=await api().pick_output(); if(p){ state.outdir=p; el("outPath").textContent=p; refresh(); } };
+
+// 渲染连接映射表(保留已填写的值);供「扫描连接名」与转换前预检共用
+function renderConnTable(names){
+  names = names || [];
+  const prev = connMap();               // 保留用户已填写的映射
+  state.conns = names;
+  const body = el("connBody"); body.innerHTML="";
+  names.forEach(n=>{
+    const tr = document.createElement("tr"); tr.dataset.name=n;
+    const val = prev[n] ? ` value="${esc(prev[n])}"` : "";
+    tr.innerHTML = `<td>${esc(n)}</td><td><input class="cname"${val} placeholder="Sight Report 里的数据连接名称(常与左侧同名)"></td>`;
+    body.appendChild(tr);
+  });
+  el("connTable").style.display = names.length? "table":"none";
+  return names;
+}
+
+// 转换前:用到但未映射的连接 → 应用内确认框(软提醒,不强制)。resolve(true)=继续,false=去映射
+function confirmUnmapped(names){
+  return new Promise(resolve=>{
+    el("connMaskList").innerHTML = names.map(n=>"• "+esc(n)).join("<br>");
+    const mask = el("connMask"); mask.style.display="flex";
+    const done = (v)=>{ mask.style.display="none"; el("connGoBtn").onclick=null; el("connMapBtn").onclick=null; resolve(v); };
+    el("connGoBtn").onclick = ()=>done(true);
+    el("connMapBtn").onclick = ()=>done(false);
+  });
+}
+
+el("scan").onclick = async()=>{
+  if(!api()) return;
+  if(!state.inputs.length){ el("scanHint").textContent="请先添加输入。"; return; }
+  el("scanHint").textContent="扫描中…";
+  const names = await api().scan_connections(state.inputs.map(x=>x.path));
+  renderConnTable(names);
+  el("scanHint").textContent = names.length? `发现 ${names.length} 个连接名,填入各自在 Sight Report 里对应的数据连接名称。` : "未发现数据库连接(可能是无数据源的报表)。";
+};
+
+el("run").onclick = async()=>{
+  if(!api()) return;
+  // 预检:若存在用到但未扫描/未映射的数据连接,先提醒(软性,可选择继续)
+  try{
+    let names = state.conns;
+    if(!names || !names.length){                 // 从未扫描过 → 自动扫一次并展开表
+      names = await api().scan_connections(state.inputs.map(x=>x.path));
+      if(names && names.length) renderConnTable(names);
+    }
+    const map = connMap();
+    const unmapped = (names||[]).filter(n=>!map[n]);
+    if(unmapped.length){
+      const go = await confirmUnmapped(unmapped);
+      if(!go){                                    // 用户选择去映射:展开表并滚动过去
+        renderConnTable(names);
+        el("scanHint").textContent = `请为以下 ${unmapped.length} 个连接填写数据连接名称后再开始转换。`;
+        try{ el("connTable").scrollIntoView({behavior:"smooth", block:"center"}); }catch(e){}
+        return;
+      }
+    }
+  }catch(e){ /* 预检失败不阻断转换 */ }
+
+  el("run").disabled=true; el("prog").style.display="block"; el("progText").textContent="准备中…";
+  el("result").innerHTML="";
+  try{
+    const res = await api().run({
+      inputs: state.inputs.map(x=>x.path),
+      outdir: state.outdir,
+      conn_map: connMap(),
+      overwrite: document.querySelector('input[name=ow]:checked').value,
+      zip: el("zip").checked,
+      merge_sheets: el("mergeSheets").checked
+    });
+    renderResult(res);
+    el("progText").textContent="完成";
+  }catch(e){
+    el("result").innerHTML = `<div class="b-bad">出错:${esc(e&&e.message||e)}</div>`;
+    el("progText").textContent="";
+  }finally{
+    el("prog").style.display="none"; el("progBar").style.width="0"; refresh();
+  }
+};
+
+// 版本号显示 + 在线更新检查(失败静默,不打扰)
+async function initVersionAndUpdate(){
+  if(!api()) return;
+  try{
+    const v = await api().version();
+    if(v && v.full) el("verText").textContent = v.full;
+  }catch(e){}
+  try{
+    const u = await api().check_update();
+    if(u && u.ok && u.hasUpdate){
+      const b = el("updBanner");
+      el("updText").innerHTML = `检测到新版本 <b>${esc(u.latest)}</b>(当前 ${esc(u.current)})`
+        + (u.notes ? ` — ${esc(u.notes)}` : "");
+      el("updBtn").style.display = u.url ? "" : "none";
+      el("updBtn").onclick = ()=>{ if(u.url) api().open_url(u.url); };
+      el("updClose").onclick = ()=>{ b.style.display="none"; };
+      b.style.display = "flex";
+    }
+  }catch(e){}
+}
+
+window.addEventListener("pywebviewready", ()=>{ apiReady=true; initVersionAndUpdate(); });
+</script>
+</body>
+</html>
