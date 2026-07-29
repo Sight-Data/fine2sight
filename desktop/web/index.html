@@ -107,7 +107,7 @@
     <h2><span class="n">3</span>数据源映射 <span class="muted" style="font-weight:400;font-size:12px">(帆软连接名 → 数据连接名称)</span></h2>
     <div class="row">
       <button id="scan">扫描连接名</button>
-      <span class="muted" id="scanHint">先添加输入,再扫描。未填写的连接转换后会标「待人工」。</span>
+      <span class="muted" id="scanHint">先添加输入,再扫描。未修改的连接默认使用帆软原始连接名,如与 Sight Report 里的名称不同请在下方调整。</span>
     </div>
     <table id="connTable" style="margin-top:10px;display:none">
       <thead><tr><th style="width:45%">帆软连接名</th><th>数据连接名称</th></tr></thead>
@@ -150,9 +150,9 @@
 <!-- 数据连接未映射提醒(应用内确认框) -->
 <div class="modal-mask" id="connMask">
   <div class="modal">
-    <h3>⚠️ 有数据连接尚未映射</h3>
-    <div class="muted" style="font-size:12.5px">以下帆软连接还没有填写对应的「数据连接名称」。未映射的连接转换后
-      <b>数据源留空</b>,导入设计器还需手工选;每个连接在上方「数据源映射」里填一次即可解决它的全部报表。</div>
+    <h3>⚠️ 有数据连接尚未确认映射</h3>
+    <div class="muted" style="font-size:12.5px">以下帆软连接还没有在「数据源映射」里确认过。转换后会
+      <b>默认使用帆软原始连接名</b>作为数据连接名称;若目标系统里的连接名称不同,请在上方「数据源映射」里改一次,即可解决它的全部报表。</div>
     <div class="conns" id="connMaskList"></div>
     <div class="acts">
       <button id="connMapBtn">去映射填写</button>
@@ -221,7 +221,7 @@ function renderResult(res){
     + (res.failed?` · <b class="b-bad">${res.failed}</b> 失败`:"")
     + ` <span class="muted">(输入 ${res.files} 文件 → ${res.reports} 张报表)</span></div>`);
   if(res.unmapped && res.unmapped.length)
-    parts.push(`<div class="sum b-warn">⚠ 未映射数据源:${res.unmapped.map(esc).join("、")} — 这些报表导入后需在设计器选数据源</div>`);
+    parts.push(`<div class="sum b-warn">⚠ 未确认映射(已默认用帆软原始连接名):${res.unmapped.map(esc).join("、")} — 若目标系统连接名不同,请核对</div>`);
   if(res.zip) parts.push(`<div class="sum">📦 已打包:<a class="link" data-open="${esc(res.zip)}">${esc(res.zip)}</a></div>`);
 
   // 待处理问题汇总(按类型 + 数据源按连接聚合 + 打开 txt/csv)
@@ -239,7 +239,7 @@ function renderResult(res){
       h += `<div class="sum" style="margin-top:8px;color:#0a7">✓ 已自动转换 · 建议抽查:<b>${it.assumed_highlights}</b> 处条件高亮(结构化条件)按推定运算符语义(=/≠/&gt;/≥/&lt;/≤)自动转换 — 数据不受影响,仅颜色方向建议抽查。</div>`;
     }
     if(it.datasource_conns && it.datasource_conns.length){
-      h += `<div class="sum b-warn" style="margin-top:8px">⚙ 数据源待映射(每个连接在上方「数据源映射」里映射一次即可解决其全部报表):</div>`;
+      h += `<div class="sum b-warn" style="margin-top:8px">⚙ 数据源未确认映射(已默认用帆软同名连接;若目标系统连接名不同,在上方「数据源映射」里改一次即可解决其全部报表):</div>`;
       h += `<ul style="margin:4px 0 0 18px;font-size:13px">`;
       it.datasource_conns.forEach(c=>{ h += `<li>连接「${esc(c.conn)}」 — ${c.reports} 张报表用到</li>`; });
       h += `</ul>`;
@@ -284,8 +284,9 @@ function renderConnTable(names){
   const body = el("connBody"); body.innerHTML="";
   names.forEach(n=>{
     const tr = document.createElement("tr"); tr.dataset.name=n;
-    const val = prev[n] ? ` value="${esc(prev[n])}"` : "";
-    tr.innerHTML = `<td>${esc(n)}</td><td><input class="cname"${val} placeholder="Sight Report 里的数据连接名称(常与左侧同名)"></td>`;
+    // 默认值=帆软原始连接名(未显式改过时直接沿用);已手工填写过的沿用用户输入(哪怕清空)
+    const filled = Object.prototype.hasOwnProperty.call(prev, n) ? prev[n] : n;
+    tr.innerHTML = `<td>${esc(n)}</td><td><input class="cname" value="${esc(filled)}" placeholder="Sight Report 里的数据连接名称(默认同名,可改)"></td>`;
     body.appendChild(tr);
   });
   el("connTable").style.display = names.length? "table":"none";

@@ -33,6 +33,16 @@ def main(inputs):
         assert set(r1["unmapped"]) == set(conns), "未映射连接应等于扫描到的连接"
         n_mrg = sum(1 for dp, _, fns in os.walk(tmp) for f in fns if f.endswith(".mrg"))
         assert n_mrg == r1["ok"], "落盘 .mrg 数应等于成功数"
+        # 未显式映射时,dataSourceName 应默认沿用帆软原始连接名(不再留空)
+        if conns:
+            hit_default = False
+            for dp, _, fns in os.walk(tmp):
+                for f in fns:
+                    if f.endswith(".mrg"):
+                        txt = open(os.path.join(dp, f), encoding="utf-8").read()
+                        if any('dataSourceName="%s"' % c in txt for c in conns):
+                            hit_default = True
+            assert hit_default, "未映射连接应默认写入帆软原始连接名作为 dataSourceName"
 
         # 2) skip:同目录再跑,全部应跳过,不新增文件
         before = _snapshot(tmp)

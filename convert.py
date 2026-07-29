@@ -273,6 +273,63 @@ def _rewrite_select(tmp):
     return tmp.replace("\x07select", "select")
 
 
+# 帆软 DATEINMONTH/DATEINQUARTER/DATEDELTA/MONTHDELTA 包 TODAY() 会被上面的规则转成
+# monthStart(now())/monthEnd(now())/quarterStart(now())/quarterEnd(now())/addDays(now(),n)/
+# addMonths(now(),n)——这些都返回 Date 对象。若整段又恰好是 CONCATENATE(...) 的顶层实参,或
+# 紧邻字符串字面量经 + 拼接,拼接会走 Java Date.toString() 默认丑陋格式(concat() 场景)或
+# 固定 yyyy-MM-dd HH:mm:ss(+ 号场景,ArithmeticHandle 默认格式),两者都不是帆软原语义的纯
+# 日期 yyyy-MM-dd。补 formatDate(expr,"yyyy-MM-dd") 显式转字符串,与 wrap_date_params_in_concat
+# (同一坑,来源是参数而非函数调用)同一思路。
+# 真机复现:CONCATENATE(DATEINMONTH(today(),1)," 00:00:00") 曾错译成
+#          concat(monthStart(now())," 00:00:00")(拼出 Date.toString 丑陋格式,非 yyyy-MM-dd)。
+_DATE_RESULT_CALL_RE = re.compile(
+    r"(?i)^(?:monthStart|monthEnd|quarterStart|quarterEnd|yearStart|yearEnd|"
+    r"addDays|addMonths)\s*\((?:[^()]|\([^()]*\))*\)$|^now\(\)$")
+_DATE_RESULT_CALL_INLINE = (
+    r"(?:(?:monthStart|monthEnd|quarterStart|quarterEnd|yearStart|yearEnd|"
+    r"addDays|addMonths)\s*\((?:[^()]|\([^()]*\))*\)|now\(\))")
+
+
+def _stringify_date_results_in_concat(tmp):
+    """CONCATENATE(...) 顶层实参若整段恰好是上面枚举的「返回 Date 对象」调用,
+    包成 formatDate(expr,"yyyy-MM-dd")。仅整段匹配才改写,避免误伤日期算术里的子表达式
+    (如 addDays(monthStart(x), 3) 整体仍是合法的单一实参,一样会被整段包裹,结果正确)。"""
+    for _ in range(6):
+        m = re.search(r"(?i)\bCONCATENATE\s*\(", tmp)
+        if not m:
+            break
+        args, end = _balanced_args(tmp, m.end() - 1)
+        if args is None:
+            break
+        changed = False
+        new_args = []
+        for a in args:
+            s = a.strip()
+            if _DATE_RESULT_CALL_RE.match(s):
+                new_args.append(' formatDate(%s, "yyyy-MM-dd")' % s)
+                changed = True
+            else:
+                new_args.append(a)
+        if changed:
+            rep = "CONCATENATE(" + ",".join(new_args) + ")"
+            tmp = tmp[:m.start()] + rep + tmp[end:]
+        else:
+            # 无日期实参需要包裹:插入标记断开 CONCATENATE 与 "(" 的相邻关系,避免死循环重复命中
+            # (标记须紧跟在函数名后、"(" 之前,\b 单词边界对标记字符前置不敏感,前置不生效)
+            matched = tmp[m.start():m.end()]
+            tmp = tmp[:m.start()] + matched.replace("CONCATENATE", "CONCATENATE\x07", 1) + tmp[m.end():]
+    return tmp.replace("CONCATENATE\x07", "CONCATENATE")
+
+
+def _stringify_date_results_near_plus(tmp):
+    """<date调用> + <字符串占位符> 或反过来,同上原因需要 formatDate 包裹(+ 号拼接场景)。"""
+    tmp = re.sub(r"(?i)(%s)(\s*\+\s*\x00\d+\x00)" % _DATE_RESULT_CALL_INLINE,
+                 lambda m: ('formatDate(%s, "yyyy-MM-dd")' % m.group(1)) + m.group(2), tmp)
+    tmp = re.sub(r"(?i)(\x00\d+\x00\s*\+\s*)(%s)" % _DATE_RESULT_CALL_INLINE,
+                 lambda m: m.group(1) + ('formatDate(%s, "yyyy-MM-dd")' % m.group(2)), tmp)
+    return tmp
+
+
 FR_ACCEPT = {**FR_SAFE, **FR_RENAME}
 
 
@@ -331,6 +388,10 @@ def translate_expression(expr):
     # 日期±整数(帆软 date±n = ±n 天)→ addDays
     tmp = re.sub(r"(?i)%s\s*-\s*(\d+)" % T, r"addDays(now(),-\1)", tmp)
     tmp = re.sub(r"(?i)%s\s*\+\s*(\d+)" % T, r"addDays(now(),\1)", tmp)
+    # 2b) 上面产出的 monthStart(now())/monthEnd(now())/addDays(now(),n) 等 Date 调用,若整段是
+    # CONCATENATE(...) 顶层实参、或紧邻字符串字面量经 + 拼接,需要显式格式化(见函数注释)。
+    tmp = _stringify_date_results_in_concat(tmp)
+    tmp = _stringify_date_results_near_plus(tmp)
     # 3) 其余 TODAY()(字符串/显示场景)→ 纯日期字符串 date()
     tmp = re.sub(r"(?i)%s" % T, "date()", tmp)
 
@@ -2116,14 +2177,20 @@ def _emit_report_head(out, sm, cfg, issues, used_ds):
         di += 1
         conn = ds.get("conn")
         # 映射值=数据连接名称(字符串);兼容旧 {id,name}(取 name)。运行时按名称解析数据源,无需 id。
-        _mv = conn_map.get(conn) if conn else None
-        ds_conn_name = (_mv.get("name") if isinstance(_mv, dict) else _mv) or ""
+        # 未显式映射时,默认直接沿用帆软原始连接名(转换结果不再留空;若目标系统连接名不同,
+        # 在转换器映射表里改一次即可覆盖默认值,全部相关报表同步生效)。
+        if conn and conn in conn_map:
+            _mv = conn_map.get(conn)
+            ds_conn_name = (_mv.get("name") if isinstance(_mv, dict) else _mv) or ""
+        else:
+            ds_conn_name = conn or ""
         ds_conn_name = ds_conn_name.strip()
         if conn and conn not in conn_map and conn not in _unmapped_seen:
             _unmapped_seen.add(conn)
             issues.append(Issue("manual", "连接:" + conn,
-                                "帆软连接「%s」未配置数据连接名称,该连接下所有数据集(含字典)的 "
-                                "dataSourceName 留空,在转换器映射一次即全部生效" % conn))
+                                "帆软连接「%s」未在转换器显式映射,已默认使用同名数据连接「%s」;"
+                                "若目标系统里的数据连接名称不同,请在映射表调整,映射一次即全部生效"
+                                % (conn, conn)))
         # 数据集 id 用唯一的 ds_N;数据源只写 dataSourceName(后端按名称解析,无需 dataSourceId)
         da = ('xmlns="" id="ds_%d" name="%s" type="sql"'
               % (di, html.escape(dsName, quote=True)))
@@ -2572,7 +2639,7 @@ def convert_one(path, outdir, cfg, subdir="", overwrite="overwrite"):
 
 
 _ISSUE_TYPE_RULES = [
-    ("数据源未映射",     lambda m: "未配置 magic 数据源" in m),
+    ("数据源未映射",     lambda m: "已默认使用同名数据连接" in m),
     ("SQL未映射函数",    lambda m: "未映射函数" in m and "SQL" in m),
     ("公式未映射函数",   lambda m: "未映射函数" in m),
     ("控件自定义JS",     lambda m: "自定义 JS" in m),
@@ -2634,9 +2701,10 @@ def write_issues_report(outdir, results):
               "  %5d  条件高亮(结构化条件)已按推定运算符语义(=/≠/>/≥/</≤)自动转换。"
               "数据不受影响,仅颜色方向需抽查;明细见 _issues.csv 同名报表的 renderItem。" % total_assumed]
     if ds_conn:
-        L += ["", "【数据源待映射 — 每个连接在转换器里映射一次即可解决其全部报表】"]
+        L += ["", "【数据源未确认映射 — 已默认使用帆软同名连接,如目标系统连接名不同,"
+                  "在转换器里改一次即可解决其全部报表】"]
         for conn, c in ds_conn.most_common():
-            L.append("  连接「%s」:%d 张报表用到 → 映射成 magic 数据源 ID" % (conn, c))
+            L.append("  连接「%s」:%d 张报表用到 → 默认沿用同名连接,如不同请调整" % (conn, c))
     # 逐条明细(按报表;排除已在上面聚合的「数据源未映射」,避免重复刷屏);超量则截断指向 CSV
     detail = [x for x in rows_csv if x[3] != "数据源未映射"]
     L += ["", "【逐条明细(按报表;数据源类见上面聚合)】"]

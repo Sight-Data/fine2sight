@@ -103,6 +103,32 @@ magic 端函数语义以 `docs/ai-docs/expression-syntax-guide.md`(MagicScript �
 - 在字符串拼接(`CONCATENATE` / `+`)中 → `date()`(返回 `yyyy-MM-dd` 字符串)
 - 作为日期对象传入日期函数(`DATEINMONTH/DATEDELTA`)或参与日期加减 → `now()` / `addDays(now(),…)`
 
+### 3.1b DATEINMONTH/DATEINQUARTER 等包裹结果同理:字符串拼接里要显式格式化
+
+上面这条规则不仅对裸 `TODAY()` 成立,对**它被 `DATEINMONTH`/`DATEINQUARTER`/`DATEDELTA`/
+`MONTHDELTA` 包裹后的翻译结果**(`monthStart(now())`/`monthEnd(now())`/`quarterStart(now())`/
+`quarterEnd(now())`/`addDays(now(),n)`/`addMonths(now(),n)`,均返回 `Date` 对象)同样成立:
+
+```
+帆软  CONCATENATE(DATEINMONTH(TODAY(),1)," 00:00:00")   期望 "2026-07-01 00:00:00"
+错误  concat(monthStart(now())," 00:00:00")   → Java Date.toString() 默认格式 + 时间串  ✗
+正确  concat(formatDate(monthStart(now()), "yyyy-MM-dd")," 00:00:00")                  ✓
+```
+
+`concat()` 脚本函数是 `StringBuilder.append`,不会应用 magic `+` 运算符那套隐式日期格式化
+(`ArithmeticHandle` 默认 `yyyy-MM-dd HH:mm:ss`);`+` 号拼接虽有隐式格式化但也不是帆软期望的
+纯日期 `yyyy-MM-dd`。两条路径都不对,故统一显式包 `formatDate(expr,"yyyy-MM-dd")`。
+
+`translate_expression` 里由 `_stringify_date_results_in_concat`(`CONCATENATE(...)` 顶层实参)
++ `_stringify_date_results_near_plus`(紧邻字符串字面量的 `+` 拼接)两个专项重写覆盖,只在
+**整段恰好是**上述几个函数调用时才包裹,不影响作为日期对象继续参与运算的场景(如
+`DATEDELTA(DATEINMONTH(TODAY(),1), 5)` → `addDays(monthStart(now()), 5)`,不包裹)。
+
+> ⚠️ 已知残留缺口:`DATEINMONTH(x, n)` 当 `x` 不是裸 `TODAY()`(如复合表达式 `today()-day(today())`
+> 或 n≠±1 走"月初+(n-1)天"近似,见 §4)时,内层若含 `TODAY()`,当前实现可能被末尾"其余 TODAY→
+> `date()`"兜底规则误转成字符串(日期对象上下文本该是 `now()`)。此为独立于本节的既有缺口,
+> 出现概率低(需要复合首参 + 非 ±1 的 n),未在本轮修复范围内。
+
 ### 3.2 FIND:参数顺序 + 基准都不同 → 不映射
 
 ```

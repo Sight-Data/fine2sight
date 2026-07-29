@@ -2,7 +2,7 @@
   "_说明": "复制本文件为 config.json 并按需修改;运行时用 -c config.json 指定。所有键都可选,缺省走内置默认。",
 
   "connection_map": {
-    "_说明": "帆软数据库连接名(.cpt 里 <Connection><DatabaseName> 的值)→ sight-report 数据连接名称。键=帆软连接名,值=Sight Report 里的数据连接名称(字符串)。运行时按名称解析数据源,无需 id。配齐后 SQL 数据集会直接绑定,无需导入后再手工选。",
+    "_说明": "帆软数据库连接名(.cpt 里 <Connection><DatabaseName> 的值)→ sight-report 数据连接名称。键=帆软连接名,值=Sight Report 里的数据连接名称(字符串)。运行时按名称解析数据源,无需 id。未在此配置的连接,默认直接沿用帆软原始连接名;仅当 Sight Report 里的连接名称与帆软不同时才需要在此显式配置。",
     "DFHIS": "门诊住院HIS库",
     "DFZHUSHUJU": "主数据库"
   },

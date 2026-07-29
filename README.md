@@ -74,7 +74,8 @@ python3 convert.py 某报表.cpt -o out --split-sheets
 ## 配置
 
 复制 `config.example.json` 为 `config.json` 修改。最重要的是 **`connection_map`**
-(帆软连接名→Sight Report 数据连接名称,按名称解析无需 id),配齐后 SQL 数据集会直接绑定数据源,免去导入后手工选。
+(帆软连接名→Sight Report 数据连接名称,按名称解析无需 id)。未在此配置的连接默认直接
+沿用帆软原始连接名作为 `dataSourceName`;仅当 Sight Report 里的连接名称与帆软不同时才需要配置。
 另有 `length_divisor`(行高列宽换算)、`font_size_divisor`(字号换算)两个标定常数,
 导入后觉得尺寸/字号不合适时调它们。详见配置文件内注释。
 
@@ -98,7 +99,8 @@ python3 convert.py 某报表.cpt -o out --split-sheets
 
 - 含未映射函数的公式:逐格标 🔶,交人工/AI 处理
 - 结构化条件高亮(靠 `op` 码比较):语义不确定,不硬猜,标 ⚠️ 交人工在设计器配;公式条件已自动转
-- 未映射的数据源:`connection_map` 没配的连接,导入后手工选(报告标 ⚠️)
+- 未在 `connection_map` 显式配置的数据源:默认沿用帆软原始连接名(报告标 ⚠️ 提示核对);
+  若 Sight Report 里的连接名称不同,需在 `connection_map` 里配置对应关系
 - 富文本/斜线表头:仅提取纯文本
 - 图表 / 子报表 / 填报:不处理
 
@@ -110,7 +112,6 @@ python3 convert.py 某报表.cpt -o out --split-sheets
 ## 已知局限
 
 - 复杂分组小计的父格绑定靠位置自动推断,建议人工核对
-- 行高/列宽/字号换算常数建议用真机导入结果校准后固化到 `config.json`
 
 ## License
 
