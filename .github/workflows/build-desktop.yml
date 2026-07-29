@@ -39,11 +39,21 @@ jobs:
         working-directory: desktop
         run: build-windows.bat
 
+      # GitHub Artifact/Release 环节对中文文件名的支持不可靠(2026-07-29 v1.1.1 首次
+      # 实测:CI 产物变成 default.exe),产物内容不受影响,统一改英文文件名再上传。
+      - name: 规整产物文件名(改英文,规避 Artifact/Release 丢字符)
+        shell: pwsh
+        working-directory: desktop/dist
+        run: |
+          $exe = Get-ChildItem -Filter *.exe | Select-Object -First 1
+          if (-not $exe) { throw "找不到打包出的 .exe(desktop/dist 下没有任何 .exe)" }
+          Rename-Item $exe.FullName "finereport-converter-windows-x64.exe"
+
       - name: 上传构建产物
         uses: actions/upload-artifact@v4
         with:
           name: windows-exe
-          path: desktop/dist/*.exe
+          path: desktop/dist/finereport-converter-windows-x64.exe
           if-no-files-found: error
 
   macos:
@@ -67,11 +77,17 @@ jobs:
         working-directory: desktop/dist
         run: ditto -c -k --sequesterRsrc --keepParent "帆软报表转换器.app" "帆软报表转换器-mac.zip"
 
+      # 同上(2026-07-29 实测 Release 资产名丢了中文前缀,只剩 "-mac.zip");
+      # .app 内部名称不受影响,仍是"帆软报表转换器.app"。
+      - name: 规整产物文件名(改英文,规避 Artifact/Release 丢字符)
+        working-directory: desktop/dist
+        run: mv "帆软报表转换器-mac.zip" "finereport-converter-mac.zip"
+
       - name: 上传构建产物
         uses: actions/upload-artifact@v4
         with:
           name: macos-app
-          path: desktop/dist/*.zip
+          path: desktop/dist/finereport-converter-mac.zip
           if-no-files-found: error
 
   smoke-test:

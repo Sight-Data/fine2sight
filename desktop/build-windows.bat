@@ -16,16 +16,12 @@ if exist build rmdir /s /q build
 if exist dist rmdir /s /q dist
 del /q *.spec 2>nul
 
-pyinstaller --noconfirm --clean --windowed --onefile ^
-  --name "帆软报表转换器" ^
-  --icon "assets\icon.ico" ^
-  --collect-all webview ^
-  --add-data "web;web" ^
-  --paths ".." ^
-  --hidden-import convert ^
-  --hidden-import version ^
-  --hidden-import _build ^
-  app.py
+REM 中文 --name 不走 .bat 里的命令行实参(cmd.exe 按活动代码页解析中文实参不可靠;
+REM 2026-07-29 在 GitHub Actions windows-latest 上实测过 --name 失效、产物变成
+REM default.exe,本机是否同样触发未测,但风险同源,一并改掉),改由 _pyinstaller_win.py
+REM 里的 Python 字符串字面量提供,子进程走 CreateProcessW 宽字符 API 拼命令行,
+REM 不受代码页影响。
+python _pyinstaller_win.py
 if errorlevel 1 goto :err
 
 echo.
