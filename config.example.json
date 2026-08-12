@@ -17,6 +17,13 @@
 
   "default_font_family": "微软雅黑",
 
+  "wrap_mode": "row",
+  "_wrap_mode说明": "内容超长时的行为。row=换行撑高行(默认,对齐帆软「页面设置>根据单元格内容自动调整」的默认档「行高」);none=截断(1.1.1 及以前的行为)。",
+
+  "auto_width": false,
+  "auto_width_max": null,
+  "_auto_width说明": "给所有列标 widthMode=auto(按内容定宽,行高不变),需 Sight Report 2.0.25+。整表一刀切,不是按帆软单元格设置驱动——那个属性在 .cpt XML 里的名称与取值编码尚未取证。auto_width_max 是每列宽度上限(pt),留 null 则由引擎按设计宽度推导。",
+
   "font_name_map": {
     "_说明": "帆软字体名(小写)→ 中文字体名。可按贵院字体补充。",
     "simhei": "黑体",

@@ -53,6 +53,23 @@ DEFAULT_CONFIG = {
     "merge_sheets": True,
     # 单元格内边距(pt,整数)。补一点避免数字贴边/挤在一起。0 关闭。
     "cell_padding": 2,
+    # ── 内容自适应 ──────────────────────────────────────────────────────
+    # 帆软「页面设置>根据单元格内容自动调整」三档:否 / 行高 / 列宽,**默认「行高」**;
+    # 单元格「其他」可覆盖(跟随页面设置/不自动调整/自动调整行高/自动调整列宽)。
+    # 见 https://help.fanruan.com/finereport/doc-view-205.html 与 doc-view-1231.html。
+    #
+    # 转换器长期把所有单元格写死 wordWrap="false",等价于「不自动调整」——**这不是帆软的默认档**,
+    # 内容超长在帆软里会撑高行、转过来却被截断。故默认改为 "row"(＝帆软默认的自动调整行高)。
+    #   "row"  → wordWrap=true(换行撑高行),对齐帆软默认
+    #   "none" → wordWrap=false(截断),旧行为;整批模板确实都设过「不自动调整」时才用
+    "wrap_mode": "row",
+    # 是否给数据列标 widthMode="auto"(sight-report 2.0.25+ 的「行高不变按内容定宽」)。
+    # 默认关闭:.cpt 里那个「自动调整列宽」属性的 XML 名称与取值编码尚未取证(本机无样例、
+    # 官方文档只讲界面不讲 XML),**不猜**;需要的人显式开,或等拿到真实样例后改成按属性驱动。
+    "auto_width": False,
+    # auto_width 打开时给每列写的上限(pt)。留空则不写,由引擎按设计宽度推导
+    # (max(w×1.5, w+50) 封顶 150pt)。
+    "auto_width_max": None,
     # 帆软数据库连接名 → magic 数据源。键=帆软 DatabaseName,值={id,name}
     "connection_map": {},
     # 帆软字体名 → 中文字体名
@@ -881,6 +898,7 @@ def parse_cpt(path):
                 row_h = _parse_size_list(el)
             elif lt == "ColumnWidth" and not col_w:
                 col_w = _parse_size_list(el)
+        _probe_adjust_attrs(rep, issues)
         n_content = sum(1 for c in cells.values() if c["kind"] != "empty")
         sheets.append({"sheet": sheet_name, "cells": cells, "row_h": row_h,
                        "col_w": col_w, "issues": issues, "n_content": n_content})
@@ -889,6 +907,34 @@ def parse_cpt(path):
     name = os.path.splitext(os.path.basename(path))[0]
     return {"name": name, "datasets": datasets, "styles": styles,
             "sheets": sheets, "query": query}
+
+
+def _probe_adjust_attrs(rep, issues):
+    """取证探针:把 .cpt 里任何与「自动调整」相关的属性原样记进转换报告。
+
+    为什么只记录不消费:帆软的自动调整设置在界面上是「页面设置>根据单元格内容自动调整」
+    (否/行高/列宽,默认行高)加「单元格>其他」的四档覆盖,但**它在 .cpt XML 里的元素名、
+    属性名与取值编码没有公开文档**,本机也没有 .cpt 样例可比对。猜一个名字去驱动版面,
+    错了会静默产出错版面且很难发现 —— 比不做更糟。
+
+    所以这里只做一件事:发现任何 name 里含 adjust 的属性就原样报出来。
+    第一份真实模板跑一遍,报告里就会出现确切的元素/属性/取值,那时再改成按属性驱动
+    (把 wrap_mode / auto_width 从「整批一刀切」升级成「按单元格设置」)。
+    """
+    seen = set()
+    for el in rep.iter():
+        for k, v in el.attrib.items():
+            if "adjust" not in k.lower():
+                continue
+            key = (local(el.tag), k, v)
+            if key in seen:
+                continue
+            seen.add(key)
+            issues.append(Issue(
+                "info", "自适应取证",
+                "发现疑似自动调整属性 <%s %s=\"%s\">;当前版本不消费它(取值编码未取证),"
+                "整批行为由配置 wrap_mode / auto_width 决定。请把这一条反馈给维护者以便"
+                "改成按单元格设置驱动。" % (local(el.tag), k, v)))
 
 
 # 帆软查询控件 → magic 查询组件类型
@@ -2272,8 +2318,8 @@ def _emit_grid_lines(out, sm, cfg, cells, subordinate, max_r, max_c):
     for c in range(1, max_c + 1):
         w = sm["col_w"].get(c - 1)
         out.append('    <col xmlns="" id="col_%d" num="%d" width="%s" '
-                   'hidden="false" lock="false" />'
-                   % (c, c, round(w / div, 2) if w else 100))
+                   'hidden="false" lock="false"%s />'
+                   % (c, c, round(w / div, 2) if w else 100, _auto_width_attrs(cfg)))
 
     for r in range(max_r):
         for c in range(max_c):
@@ -2389,19 +2435,20 @@ def _emit_cell(cell, cfg):
         a["align"] = "center"
     a["valign"] = "middle"
 
+    wrap = _word_wrap(cfg)
     s = ['    <cell xmlns="" %s>' % attr(a)]
     if kind == "dataset":
         s.append('        <datasetContent %s />' % attr({
             "dataset": cell["dsName"] or "", "field": cell["field"] or "",
-            "wordWrap": "false", "aggregateType": cell["agg"] or "select",
+            "wordWrap": wrap, "aggregateType": cell["agg"] or "select",
             "enabledParentCellFilter": "true", "enabledCollapse": "false",
             "order": "none"}))
     elif kind == "expression":
-        s.append('        <expressionContent wordWrap="false">%s'
-                 '</expressionContent>' % cdata(cell["text"]))
+        s.append('        <expressionContent wordWrap="%s">%s'
+                 '</expressionContent>' % (wrap, cdata(cell["text"])))
     else:
-        s.append('        <textContent wordWrap="false">%s</textContent>'
-                 % cdata(cell["text"]))
+        s.append('        <textContent wordWrap="%s">%s</textContent>'
+                 % (wrap, cdata(cell["text"])))
     # 显示格式化(数字/百分比/日期)→ 仅数值/表达式格(遵循 XSD:content 后、renderItem 前)
     if kind in ("dataset", "expression") and style and style.get("fmt_type"):
         s.append('        <format formatType="%s">%s</format>'
@@ -2430,6 +2477,26 @@ def _emit_render_item(hl):
             '        </renderItem>'
             % (html.escape(hl["name"], quote=True),
                html.escape(hl["expr"], quote=True), "\n".join(contents)))
+
+
+def _word_wrap(cfg):
+    """按 wrap_mode 决定单元格是否换行。见 DEFAULT_CONFIG["wrap_mode"] 的说明。"""
+    return "false" if cfg.get("wrap_mode") == "none" else "true"
+
+
+def _auto_width_attrs(cfg):
+    """auto_width 打开时给 <col> 追加自适应属性(sight-report 2.0.25+)。
+
+    注意这是**整表一刀切**,不是按帆软的单元格设置驱动 —— 那个属性的 XML 名称与取值编码
+    还没取证,见 DEFAULT_CONFIG["auto_width"] 的说明。所以默认关闭、由使用者按模板批次决定。
+    """
+    if not cfg.get("auto_width"):
+        return ""
+    s = ' widthMode="auto"'
+    mx = cfg.get("auto_width_max")
+    if mx:
+        s += ' maxWidth="%s"' % mx
+    return s
 
 
 def _emit_placeholder(r, c, visible, colspan, rowspan):
@@ -2471,6 +2538,12 @@ def write_report(title, sm, issues):
     if degraded:
         L.append("## 🔶 已降级(请复核)\n")
         L += ["- `%s` — %s" % (i.where, i.msg) for i in degraded] + [""]
+    # 自适应取证:单开一节。这类条目是 info 级,而 info 既不进 _issues.txt(_issue_rows 只收
+    # manual/degraded)也不进上面两节 —— 不单独列出来的话探针等于白写(第一版就这么假绿了)。
+    probe = [i for i in uniq if i.level == "info" and i.where == "自适应取证"]
+    if probe:
+        L.append("## 🔍 自适应取证(不影响本次转换结果)\n")
+        L += ["- %s" % i.msg for i in probe] + [""]
     if not manual and not degraded:
         L.append("✅ 未发现需人工的项,建议导入后在设计器抽查扩展/分组。\n")
     return "\n".join(L), len(manual), len(degraded), n_cells
@@ -2747,10 +2820,24 @@ def main():
                     help="把转出的 .mrg 按目录树打包到此 zip,供报表系统 /import 一次性批量导入")
     ap.add_argument("--split-sheets", action="store_true",
                     help="多 sheet 的 .cpt 拆成多张独立 .mrg(默认合并为单个多页签报表)")
+    ap.add_argument("--wrap-mode", choices=("row", "none"), default=None,
+                    help="内容超长时:row=换行撑高行(默认,对齐帆软默认档「自动调整行高」);"
+                         "none=截断(旧行为)")
+    ap.add_argument("--auto-width", action="store_true",
+                    help="给所有列标 widthMode=\"auto\"(按内容定宽,需 sight-report 2.0.25+)。"
+                         "整表一刀切,不是按帆软单元格设置驱动")
+    ap.add_argument("--auto-width-max", type=float, default=None,
+                    help="配合 --auto-width:每列宽度上限(pt);不给则由引擎按设计宽度推导")
     args = ap.parse_args()
     cfg = load_config(args.config)
     if args.split_sheets:
         cfg["merge_sheets"] = False
+    if args.wrap_mode:
+        cfg["wrap_mode"] = args.wrap_mode
+    if args.auto_width:
+        cfg["auto_width"] = True
+    if args.auto_width_max:
+        cfg["auto_width_max"] = args.auto_width_max
     os.makedirs(args.out, exist_ok=True)
 
     pairs = []  # (cpt路径, 相对子目录)
