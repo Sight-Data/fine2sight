@@ -61,7 +61,8 @@
 | `ComboBox` | `select` | |
 | `ComboCheckBox` | `multiselect` | |
 | `RadioGroup` | `radio` | |
-| `CheckBoxGroup` | `checkbox` | |
+| `CheckBoxGroup` | `checkbox` | 复选框**组**，选项来自 `<Dictionary>`，值是数组 |
+| `CheckBox` | `switch` | 单个布尔勾选。**不可与 `CheckBoxGroup` 合并映射**，见 §3 #2 |
 | `FormSubmitButton` | `query` | 查询按钮 |
 
 ### 2.2 下拉选项来源
@@ -76,16 +77,41 @@
 | 帆软 | magic |
 |---|---|
 | `WidgetName name` | `parameterName`(同时是参数名) |
+| **多值控件**(`ComboCheckBox`/`CheckBoxGroup`) | 参数 `datatype="List"`(**不是 String**,见下) |
 | `LabelName` | `label` |
 | `BoundsAttr x/y/width/height` | `position{x,y,width,height}` |
 | `widgetValue`(常为公式) | 参数 `defaultValue`(公式经表达式翻译,`defaultValueIsExpression=true`) |
 | `allowBlank=false` | `props.required=true` |
 | 面板 `delayPlaying=true` | `<setting fetchDataWhenOpen="false">`(取反) |
 
-### 2.4 参数类型(改为从控件推断,比从默认值猜准)
+### 2.4 参数类型(从控件推断,比从默认值猜准)
 
-`DateEditor`→`Date`/`DateTime`(看 format)、`NumberEditor`→`Number`、其余→`String`。
-当前实现是从默认值字符串猜,应改为优先用控件类型。
+`DateEditor`→`Date`/`DateTime`(看 format)、`NumberEditor`→`Number`、
+`CheckBox`→`Boolean`、**`ComboCheckBox`/`CheckBoxGroup`→`List`**、其余→`String`。
+
+#### ⚠️ 多值参数为什么必须是 `List`(2026-08-13 真机 group_demo 实证)
+
+声明成 `String` 时,后端 `Datatype.String.parse` 原样放行,**首屏**参数值是字符串 `"1"`;
+而 SQL 侧的动态 IN 片段生成的是 `$p.join("','")` —— String 上没有 `join` 扩展方法,
+会误命中 JDK 静态 `String.join(sep)`(变参为空)恒返 `""` → 空值守卫恒真 →
+**整段 IN 条件从 SQL 里消失**,不报错、直接返回全量数据。
+
+真机后端日志(修复前 / 修复后同一张报表首屏):
+
+```sql
+-- 修复前：病区默认值 "1" 完全没进 SQL
+) t where 1=1
+ and t.riqilx = ?
+
+-- 修复后（datatype="List"）
+) t where 1=1
+ and t.bqid in ('1')
+ and t.riqilx = ?
+```
+
+用户**手动勾一次**之后前端提交的是数组,`.join` 就正常了 —— 所以这个 bug 只在
+「打开就查」的首屏出现,线上极难被发现。声明 `List` 后 `Datatype.List.parse` 走
+`ListValueParser`(`"1"` → `["1"]`、`""` → 空集合),前端复选框/多选下拉也能正确回显默认勾选。
 
 ---
 
@@ -94,13 +120,35 @@
 | # | 帆软特性 | 频次 | magic 现状 | 建议 |
 |---|---|---|---|---|
 | 1 | **自定义 JS 监听**(`afteredit` 等,做级联下拉/自定义校验) | 831 | 查询组件无 JS 钩子 | **兼容**:省→市这类**级联下拉**可尝试映射 magic `tree-select` 或「数据集随上级参数过滤」近似;任意业务 JS → **标红交人工**。**扩充**(加 JS 钩子)成本高、属产品决策,暂不建议 |
-| 2 | **单个 `CheckBox`**(布尔勾选) | 172 | magic `checkbox` 是复选框**组** | **兼容**:降级为单选项 checkbox 组,或布尔 `select`(是/否)。语义损失小 |
+| 2 | ~~**单个 `CheckBox`**(布尔勾选)~~ | 172 | **已解决**(2026-08-13):magic 新增 `switch` 组件 | 见下方「#2 已解决」 |
 | 3 | **`FreeButton` 自定义按钮** | 389 | 仅 `query`/`reset` | **兼容**:文案/动作是标准查询、重置 → `query`/`reset`;带自定义 JS 动作 → 标红 |
 | 4 | **`EditorHolder` 容器控件** | 18 | 无对应 | **标红**(极少,人工处理) |
 | 5 | **控件级装饰样式**(每控件字体/边框/背景) | 多 | `component.style` 仅 `labelWidth/width/showLabel/labelPosition` | **兼容**:丢弃装饰样式,保留标签/位置/尺寸。查询面板美观损失很小 |
 | 6 | **面板标题 / 窗口位置 / 对齐**(`PWTitle`/`windowPosition`/`align`) | 全量 | `queryFormSetting` 无面板级元数据 | **兼容**:丢弃(magic 面板自带样式)。如需保留面板标题 → 可**扩充** `ReportQuerySetting` 加 `title` 字段(小改) |
 
-> 仅 #1(自定义 JS 联动)是有规模的硬 gap;#2–#6 都能确定性映射或低成本近似/降级。
+> 仅 #1(自定义 JS 联动)是有规模的硬 gap;#3–#6 都能确定性映射或低成本近似/降级。
+
+### #2 已解决(2026-08-13)
+
+这条 gap 在文档里挂了很久但**从没落进 `convert.py`** —— `WIDGET_TYPE` 把 `CheckBox` 和
+`CheckBoxGroup` 一起写成了 `checkbox`。真机(住院病人信息查询「包含冲销」)的表现是:
+
+- 单个 `CheckBox` 没有 `<Dictionary>` → `_fill_options` 直接 `return` → `props` 为空;
+- 前端 `el-checkbox-group` 循环空选项数组 → **渲染出一个什么都看不见的空容器**;
+- 转换报告一条提示都没有(info 级问题当时既不进 `_issues.txt` 也不进报告)。
+
+现在的做法(sight-report 侧同步新增了 `switch` 组件类型):
+
+| 项 | 取值 | 为什么 |
+|---|---|---|
+| `type` | `switch` | magic 2026-08-13 新增的布尔开关,不需要选项 |
+| `label` | `<Text>` 的内容 | 勾选框旁那行字才是可见文案。`LabelName` 常是设计器残留(真机上是「不为0:」) |
+| 参数 `datatype` | `Boolean` | 声明成 String 时后端 `Datatype.String` 原样放行 `"false"`,SQL 里的 `$p == true` 恒不成立**且不报错** |
+| 参数 `defaultValue` | `widgetValue` 的 `<O t="B">` | `true`/`false` 二选一,绝不写空串(后端对 `""` 是旁路返回、不转 Boolean) |
+| SQL | `$p == true` 原样保留 | 布尔参数已排除出「多选 `.join`」与「`'${p}'` 内联字面量」两条改写路径 |
+
+外观从勾选框变成开关,这一点会在转换报告的「ℹ️ 自动处理说明」里逐条列出。
+回归用例:`test_query_widgets.py`(单 `CheckBox` / `CheckBoxGroup` / `RadioGroup` 三者互不串味)。
 
 ---
 

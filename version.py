@@ -11,7 +11,7 @@
   可被 config.json 的 update_check_url 覆盖(见 core_api.check_update)。
 """
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 
 # 官网最新版清单(按顺序尝试:主域名优先,备用域名兜底)。
 # 清单文件在仓库里:website/public/finereport-converter/latest.json(随官网部署到 /opt/website/public/)。

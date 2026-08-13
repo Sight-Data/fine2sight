@@ -556,7 +556,7 @@ def _sql_expr(inner):
 
 
 def translate_sql(sql, ident_params=None, prequoted_params=None, date_params=None,
-                  multi_params=None):
+                  multi_params=None, bool_params=None):
     """帆软 SQL → magic SQL。返回 (新SQL, 未映射函数集)。"""
     if not sql:
         return sql, set()
@@ -608,6 +608,9 @@ def translate_sql(sql, ident_params=None, prequoted_params=None, date_params=Non
                  out)
     # 预编译占位符不能裹在引号内(否则成 '?' 失去绑定):'${$x}'→${$x};'%${$x}%'→${'%'+$x+'%'}
     _dp = date_params or set()
+    # 布尔参数(帆软单 CheckBox → magic switch)与日期参数同样不可内联成 "'"+$p+"'":
+    # 运行时值是 java Boolean,内联会得到字面量 'true' 去和布尔/数值列比较;维持 ? 绑定才对。
+    _bp = bool_params or set()
 
     def _qfix(m):
         op = m.group(1)
@@ -620,7 +623,7 @@ def translate_sql(sql, ident_params=None, prequoted_params=None, date_params=Non
         # 日期参数维持 ? 绑定(对日期列本就正确)。仅纯参数(无前后缀)才改。
         if op and not pre and not suf:
             p = inner.lstrip("$")
-            if p not in _dp:
+            if p not in _dp and p not in _bp:
                 return ('%s #{isEmpty($%s) || $%s == \'\' ? "null" : "\'" + $%s + "\'"}'
                         % (op, p, p, p))
         # ⚠️ op 是正则「可选前导比较运算符」捕获来的,不属于占位符本身,任何分支都必须原样吐回去。
@@ -667,6 +670,10 @@ def translate_sql(sql, ident_params=None, prequoted_params=None, date_params=Non
         # 故守卫改判「join 结果是否为空」:既挡 null/[](isEmpty 短路)又挡 [''](join=="")。
         p = mm.group(1)
         q = chr(39)  # 单引号
+        if p.lstrip("$") in _bp:
+            # 布尔参数上的 len(p)==0:帆软里这是「没勾」的写法,magic 侧值是真 Boolean,
+            # isEmpty/== '' 两个判断在 Boolean 上都不成立 → 守卫恒 false,条件永远生效。
+            return "(%s != true)" % p
         if not _is_multi(p):
             # 单选/文本参数是 String:直接判空串即可(isEmpty 挡 null,== '' 挡空串)
             return "(isEmpty(%s) || %s == %s%s)" % (p, p, q, q)
@@ -938,11 +945,18 @@ def _probe_adjust_attrs(rep, issues):
 
 
 # 帆软查询控件 → magic 查询组件类型
+# ⚠️ CheckBox 与 CheckBoxGroup 是两种控件,不能都映射成 checkbox(2026-08-13 真机:
+#    住院病人信息查询「包含冲销」):
+#    · CheckBoxGroup 是复选框「组」,带 <Dictionary> 选项 → magic checkbox(值=数组)。
+#    · CheckBox 是单个布尔勾选,没有 Dictionary,勾选文案在 <Text> 里,值是 <O t="B">true/false。
+#      映射成 checkbox 会让 _fill_options 因无 Dictionary 直接 return → 选项为空,
+#      前端 el-checkbox-group 循环空数组 = 渲染出一个什么都没有的空容器(界面上完全看不见),
+#      且转换报告一条提示都没有。故单独走 switch(magic 2026-08-13 新增的布尔开关组件)。
 WIDGET_TYPE = {
     "Label": "text", "DateEditor": "date", "TextEditor": "input",
     "NumberEditor": "number", "ComboBox": "select",
     "ComboCheckBox": "multiselect", "RadioGroup": "radio",
-    "CheckBoxGroup": "checkbox", "CheckBox": "checkbox",
+    "CheckBoxGroup": "checkbox", "CheckBox": "switch",
     "FormSubmitButton": "query",
 }
 
@@ -1034,10 +1048,32 @@ def _parse_query_panel(root, datasets=None):
                                        else "date")
         if mtype in ("select", "multiselect", "radio", "checkbox"):
             _fill_options(inner, {"props": props}, ds_used, issues, name or label, datasets)
+        if mtype == "switch":
+            # 单个 CheckBox 的可见文案在 <Text> 里(截图上勾选框右边那行字),不是 LabelName。
+            # LabelName 常是设计器里的历史残留(真机:文案「包含冲销」而 LabelName 是「不为0:」),
+            # 照搬会把界面标成另一件事。<Text> 缺失时才退回 LabelName。
+            label = _child_text(inner, "Text") or label
+            issues.append(Issue("info", "查询面板:" + (label or name or "勾选"),
+                                "帆软单个复选框(布尔勾选)已转为 magic「开关」组件、参数类型 Boolean;"
+                                "外观由勾选框变成开关,语义(true/false)与 SQL 里的布尔比较不变"))
         default, is_expr = _widget_default(inner)
+        if mtype == "switch":
+            # 帆软 <widgetValue><O t="B">false</O>;magic 侧参数必须是 Boolean——
+            # 声明成 String 时后端 Datatype.String 原样放行 "false",SQL 里的 $p == true
+            # 恒不成立且不报错(该筛选条件永远关不掉)。
+            default = "true" if str(default).strip().lower() == "true" else "false"
+        # ⚠️多值控件必须声明 List,不能是 String(2026-08-13 真机:复选框组「病区」默认值静默失效):
+        # 声明成 String 时后端 Datatype.String.parse 原样放行,首屏参数值是**字符串** "1",
+        # 而 SQL 侧的动态 IN 片段生成的是 $p.join("','") —— String 上没有 join 扩展方法,
+        # 会误命中 JDK 静态 String.join(sep) 恒返 "" → 空值守卫恒真 → **整段 IN 条件从 SQL 里消失**,
+        # 不报错、直接返回全量数据。用户手动勾一次后前端提交的是数组,反而正常了,所以极难发现。
+        # 声明 List 后 Datatype.List.parse 走 ListValueParser("1" → ["1"]、"" → 空集合),
+        # 前端 checkbox/multiselect 拿到数组也能正确回显默认勾选。
         dtype = ("DateTime" if mtype == "date" and "HH" in (props.get("format") or "")
                  else "Date" if mtype == "date"
-                 else "Number" if mtype == "number" else "String")
+                 else "Number" if mtype == "number"
+                 else "Boolean" if mtype == "switch"
+                 else "List" if mtype in ("multiselect", "checkbox") else "String")
         if name:
             meta[name] = {"datatype": dtype, "default": default,
                           "default_expr": is_expr, "required": props.get("required", False)}
@@ -1046,7 +1082,9 @@ def _parse_query_panel(root, datasets=None):
     # 关联:把「紧邻在参数控件左侧、同一行」的静态标签并入该控件(避免标签重复 + 修正排版)
     used = set()
     for p in params:
-        if p["type"] == "query":
+        # switch 的标签已从自身 <Text> 取到(勾选框旁那行字),再并入左侧标签会把它覆盖掉。
+        # 帆软里这类布尔勾选本就自带文案、左边的独立 Label 是另一件事,保持独立更贴近原版面。
+        if p["type"] in ("query", "switch"):
             continue
         py = p["pos"]["y"] + p["pos"]["height"] / 2
         best, gapbest = None, 1e9
@@ -1155,6 +1193,14 @@ def _parse_query_panel(root, datasets=None):
         need = sum(len(str(o.get("label") or "")) * 16 + 34 for o in opts) + 16
         avail = (min(rights) - cx - 8) if rights else need
         c["position"]["width"] = int(max(c["position"]["width"], min(need, avail)))
+
+    # switch 同理:帆软的宽度(如 87)是按「☐ + 文案」量的,magic 侧是「标签 + el-switch 开关」,
+    # 标签按 60px 预留、开关本体约 44px,照搬原宽会把文案挤断行。
+    for c in components:
+        if c["type"] != "switch":
+            continue
+        need = len(str(c.get("label") or "")) * 16 + 60
+        c["position"]["width"] = int(max(c["position"]["width"], need))
 
     # 整体上移/左移查询表单,消除帆软面板顶部/左侧留白(保留控件相对布局)。magic 预览用
     # 绝对定位 top:y、容器高=max(y+h);源里控件常放在 y=31 等→表单贴容器底、上方空一段。
@@ -2215,6 +2261,17 @@ def _emit_report_head(out, sm, cfg, issues, used_ds):
             if _mn:
                 multi_param_set.add(_mn)
 
+    # 布尔参数集合(帆软单 CheckBox → magic switch,运行时是 java Boolean):
+    # 既不能内联成 'true' 字面量,也不能当多选走 .join。以参数声明的 datatype 为准
+    # (控件侧只是它的一种来源),这样纯参数声明成 Boolean 而无对应控件时也照样成立。
+    bool_param_set = {_pn for _pn, _pm in _qmeta.items()
+                      if str(_pm.get("datatype") or "") == "Boolean"}
+    for _c in (query or {}).get("components", []):
+        if (_c.get("type") or "") == "switch":
+            _bn = _c.get("parameterName") or _c.get("name")
+            if _bn:
+                bool_param_set.add(_bn)
+
     di = 0
     _unmapped_seen = set()      # 每个连接每张报表只提示一次(同连接多数据集=同一次映射解决)
     for dsName, ds in sm["datasets"].items():
@@ -2245,7 +2302,7 @@ def _emit_report_head(out, sm, cfg, issues, used_ds):
         out.append('    <dataset %s>' % da)
         sql_out, sql_unk = translate_sql(ds.get("sql") or "", ident_params,
                                          prequoted_params, date_param_set,
-                                         multi_param_set)
+                                         multi_param_set, bool_param_set)
         out.append('        <sql>%s</sql>' % cdata(sql_out))
         if sql_unk:
             issues.append(Issue("degraded", "数据集:" + dsName,
@@ -2544,6 +2601,13 @@ def write_report(title, sm, issues):
     if probe:
         L.append("## 🔍 自适应取证(不影响本次转换结果)\n")
         L += ["- %s" % i.msg for i in probe] + [""]
+    # 其余 info:同理不进 _issues.txt 也不进上面两节。这些是「转换器替你做了决定」的地方
+    # (布尔勾选→开关、字典自动建数据集、树形下拉降级、隐藏辅助控件跳过…),不列出来
+    # 就等于静默改语义 —— 真机上「包含冲销」渲染成空白就是这么漏过去的。
+    autos = [i for i in uniq if i.level == "info" and i.where != "自适应取证"]
+    if autos:
+        L.append("## ℹ️ 自动处理说明(已转好,知悉即可)\n")
+        L += ["- `%s` — %s" % (i.where, i.msg) for i in autos] + [""]
     if not manual and not degraded:
         L.append("✅ 未发现需人工的项,建议导入后在设计器抽查扩展/分组。\n")
     return "\n".join(L), len(manual), len(degraded), n_cells
