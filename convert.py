@@ -51,6 +51,23 @@ DEFAULT_CONFIG = {
     # docs/report-tab-设计.md)。True(默认)= 一个 .cpt → 一个含 <sheets> 的 .mrg;
     # False = 每个 sheet 拆一张独立 .mrg(旧行为)。单 sheet 无论如何都走扁平老格式。
     "merge_sheets": True,
+    # 帆软「服务器数据集」文件路径(如 WEB-INF/resources/datasource.xml)。.cpt 里的 NameTableData
+    # 只存名字,定义在服务器侧;给出此文件即可解析单元格字典/下拉字典/图表对它的引用。
+    "server_datasets": None,
+    # 未能在 .cpt/server_datasets 里解析到定义的数据集引用,是否假定目标系统已有同名「公共数据集」
+    # (默认 True:按名字引用,汇总清单见 _public_datasets.txt;False:标待人工)。
+    "assume_public_datasets": True,
+    # 钻取内置:帆软超链接指向的 .cpt 若能在输入目录里找到,就转成本报表的「内嵌子报表」并让链接指向它
+    # (embeddedReportId),不再依赖导入后才有的 fileId。False=只带 fileName(旧行为)。
+    "embed_drill": True,
+    # 决策报表 .frm:"dashboard"(默认)=语义化转成仪表盘 .mrs;其他值=只在结果里列为未转换
+    "frm_mode": "dashboard",
+    # 仪表盘主题:default|medical|gold(医院场景默认 medical)
+    "dashboard_theme": "medical",
+    "embed_max_depth": 3,
+    # 钻取链接目标映射:帆软报表路径(如 /NHYY/急诊/未分诊患者列表.cpt)或报表名 → 目标系统里的
+    # {"fileId": "...", "fileCode": "..."}(或直接给 fileId 字符串)。未配则链接只带 fileName,需导入后手选。
+    "link_file_map": {},
     # 单元格内边距(pt,整数)。补一点避免数字贴边/挤在一起。0 关闭。
     "cell_padding": 2,
     # ── 内容自适应 ──────────────────────────────────────────────────────
@@ -359,6 +376,8 @@ def translate_expression(expr):
     """
     if not expr:
         return expr, set()
+    # 帆软 year()/month()/day() 无参 = 当前年/月/日;magic 的同名函数必须带日期参数
+    expr = re.sub(r"(?<![\w.])(year|month|day)\(\s*\)", r"\1(now())", expr, flags=re.I)
     # 0) 保护字符串字面量,避免误改其中内容
     strings = []
 
@@ -420,7 +439,7 @@ def translate_expression(expr):
     # 4) FORMAT(x, "格式") → 按格式串判定 formatNumber / formatDate
     def _format(m):
         arg, pat = m.group(1), m.group(2)
-        body = pat.strip("'\"")
+        body = re.sub(r"\x00(\d+)\x00", lambda mm: strings[int(mm.group(1))], pat).strip("'\"")
         if re.search(r"[yMdHs]", body) and not re.search(r"[#%]", body):
             return "formatDate(%s, %s)" % (arg, pat)
         return "formatNumber(%s, %s)" % (arg, pat)
@@ -553,6 +572,19 @@ def _sql_expr(inner):
     """翻译 ${}/#{} 内表达式:函数映射 + 参数加 $。返回 (文本, 未映射函数集)。"""
     expr, unk = translate_expression(inner)
     return _prefix_params(expr), unk
+
+
+def sql_lint(sql):
+    """SQL 体检:返回问题描述列表。目前查:字符串字面量之外的全角括号/逗号/引号(源 SQL 笔误,数据库会报错)、括号不配平。"""
+    probs = []
+    code = re.sub(r"'(?:[^']|'')*'", "''", sql or "")
+    code = re.sub(r"/\*.*?\*/|--[^\n]*", "", code, flags=re.S)
+    fw = sorted(set(re.findall(r"[（），；‘’“”]", code)))
+    if fw:
+        probs.append(("info", "含全角符号 %s(字符串之外;原样保留,Oracle 通常能容错,换库时需改成半角)" % "".join(fw)))
+    if code.count("(") != code.count(")") and not fw:
+        probs.append(("manual", "括号不配平,已原样保留,请核对"))
+    return probs
 
 
 def translate_sql(sql, ident_params=None, prequoted_params=None, date_params=None,
@@ -840,20 +872,8 @@ class Issue:
 # ----------------------------------------------------------------------------
 # 帆软 .cpt 解析 → 中间模型(workbook 共享 datasets/styles + 多 sheet)
 # ----------------------------------------------------------------------------
-def parse_cpt(path):
-    tree = ET.parse(path)
-    root = tree.getroot()  # WorkBook
-
-    # ---- 样式表(workbook 级,s="N" 引用其第 N 个 Style) ----
-    styles = []
-    for sl in root.iter():
-        if local(sl.tag) == "StyleList":
-            for st in sl:
-                if local(st.tag) == "Style":
-                    styles.append(_parse_style(st))
-            break
-
-    # ---- 数据集(workbook 级,DBTableData:SQL + 连接) ----
+def _collect_datasets(root):
+    """收集 DBTableData 数据集(SQL + 连接)。工作簿内与服务器数据集文件同结构,共用此函数。"""
     datasets = {}
     for td in root.iter():
         if local(td.tag) != "TableData":
@@ -883,6 +903,38 @@ def parse_cpt(path):
         if name:
             datasets[name] = {"name": name, "sql": sql, "conn": conn,
                               "fields": {}, "defaults": defaults}
+    return datasets
+
+
+def load_server_datasets(path):
+    """读帆软「服务器数据集」文件(WEB-INF/resources/datasource.xml 一类),返回 {名: 数据集}。
+    .cpt 里 NameTableData 只存名字引用服务器数据集,定义不在模板内;提供此文件后即可解析。"""
+    if not path or not os.path.exists(path):
+        return {}
+    try:
+        return _collect_datasets(ET.parse(path).getroot())
+    except ET.ParseError:
+        return {}
+
+
+def parse_cpt(path, server_datasets=None):
+    tree = ET.parse(path)
+    root = tree.getroot()  # WorkBook
+
+    # ---- 样式表(workbook 级,s="N" 引用其第 N 个 Style) ----
+    styles = []
+    for sl in root.iter():
+        if local(sl.tag) == "StyleList":
+            for st in sl:
+                if local(st.tag) == "Style":
+                    styles.append(_parse_style(st))
+            break
+
+    # ---- 数据集(workbook 级,DBTableData:SQL + 连接) ----
+    # 模板内同名定义优先;其余引用(NameTableData)回落到服务器数据集文件(如提供)。
+    datasets = {k: dict(v, fields={}, defaults=dict(v["defaults"]), _server=True)
+                for k, v in (server_datasets or {}).items()}
+    datasets.update(_collect_datasets(root))
 
     # ---- 逐工作表(Report)解析 ----
     sheets = []
@@ -953,7 +1005,7 @@ def _probe_adjust_attrs(rep, issues):
 #      前端 el-checkbox-group 循环空数组 = 渲染出一个什么都没有的空容器(界面上完全看不见),
 #      且转换报告一条提示都没有。故单独走 switch(magic 2026-08-13 新增的布尔开关组件)。
 WIDGET_TYPE = {
-    "Label": "text", "DateEditor": "date", "TextEditor": "input",
+    "Label": "text", "DateEditor": "date", "Year": "date", "TextEditor": "input", "TextArea": "input",
     "NumberEditor": "number", "ComboBox": "select",
     "ComboCheckBox": "multiselect", "RadioGroup": "radio",
     "CheckBoxGroup": "checkbox", "CheckBox": "switch",
@@ -972,6 +1024,7 @@ def _parse_query_panel(root, datasets=None):
     delay = attrs is not None and attrs.get("delayPlaying") == "true"
     meta, issues, ds_used = {}, [], set()
     labels, params = [], []   # 先分别收集「静态标签」与「参数/按钮控件」
+    pending_defaults = {}      # afterinit setValue 脚本给的初始值
     for bw in rpa.iter():
         if local(bw.tag) != "Widget" or "BoundsWidget" not in bw.get("class", ""):
             continue
@@ -983,13 +1036,19 @@ def _parse_query_panel(root, datasets=None):
         mtype = WIDGET_TYPE.get(kind)
         name = _child_attr(inner, "WidgetName", "name") or ""
         label = _child_attr(inner, "LabelName", "name") or ""
-        if _has_real_js(inner):
+        js_unknown, js_setv, js_export = _js_classify(inner)
+        if js_unknown:
             issues.append(Issue("manual", "查询面板:" + (name or label or kind),
                                 "控件含自定义 JS(联动/赋值),已忽略 JS,如需请在设计器重配"))
+        pending_defaults.update(js_setv)
         if mtype is None:
             if kind == "FreeButton":
-                issues.append(Issue("manual", "查询面板",
-                                    "FreeButton 自定义按钮(常为重置/自定义动作)未转换,需手工加"))
+                if js_export:
+                    issues.append(Issue("info", "查询面板:" + (name or label or kind),
+                                        "FreeButton 是「导出 Excel」按钮,未转换:SightReport 报表工具栏自带导出"))
+                else:
+                    issues.append(Issue("manual", "查询面板",
+                                        "FreeButton 自定义按钮(常为重置/自定义动作)未转换,需手工加"))
                 continue
             if kind == "TreeComboBoxEditor":
                 # 分层数据集树:①可约化为单表自引用→UNION 扁平(eager,零后端);②否则→懒加载 treeLevels
@@ -1040,11 +1099,14 @@ def _parse_query_panel(root, datasets=None):
         if _child_text(inner, "allowBlank") == "false":
             props["required"] = True
         if mtype == "date":
-            fmt = _child_attr(inner, "DateAttr", "format") or "yyyy-MM-dd"
+            # 帆软 Year 插件控件(com.fr.plugin.widget.year.Year)没有 DateAttr,固定只选年份。
+            fmt = ("yyyy" if kind == "Year"
+                   else _child_attr(inner, "DateAttr", "format") or "yyyy-MM-dd")
             props["format"] = fmt
             props["valueFormat"] = fmt
             props["datePickerType"] = ("datetime" if ("HH" in fmt or "hh" in fmt)
                                        else "month" if re.fullmatch(r"yyyy[-/]?MM", fmt)
+                                       else "year" if fmt == "yyyy"
                                        else "date")
         if mtype in ("select", "multiselect", "radio", "checkbox"):
             _fill_options(inner, {"props": props}, ds_used, issues, name or label, datasets)
@@ -1078,6 +1140,14 @@ def _parse_query_panel(root, datasets=None):
             meta[name] = {"datatype": dtype, "default": default,
                           "default_expr": is_expr, "required": props.get("required", False)}
         params.append({"type": mtype, "name": name, "label": label, "pos": pos, "props": props})
+
+    # afterinit 里 setValue 设的初始值:控件自己没配默认值时当作参数默认值
+    for pn, pv in pending_defaults.items():
+        mm = meta.get(pn)
+        if mm is not None and mm.get("default") in (None, "") and not mm.get("default_expr"):
+            mm["default"] = pv
+            if issues is not None:
+                issues.append(Issue("info", "查询面板:" + pn, "控件 afterinit 脚本把它设为「%s」,已作为参数默认值" % pv))
 
     # 关联:把「紧邻在参数控件左侧、同一行」的静态标签并入该控件(避免标签重复 + 修正排版)
     used = set()
@@ -1260,13 +1330,40 @@ def _bounds(b):
             "height": int(float(b.get("height", 28)))}
 
 
-def _has_real_js(inner):
+_JS_COSMETIC = re.compile(r"^setTimeout\(function\(\)\s*\{\s*\$\('\.parameter-container-collapseimg-up'\)\.hide\(\);?\s*\}\s*,\s*\d+\s*\);?$")
+_JS_SETVAL = re.compile(r'^var\s+\S+\s*=\s*this\.options\.form\.getWidgetByName\("(\w+)"\)\.setValue\("([^"]*)"\);?$')
+
+
+def _js_classify(inner):
+    """控件上的 JS 监听 → (有无无法识别的 JS, {参数名: 初始值} 来自 afterinit 的 setValue, 是否导出 Excel 脚本)。
+    - 收起查询面板箭头(隐藏 .parameter-container-collapseimg-up)是纯外观,直接忽略、不报;
+    - afterinit 里 getWidgetByName("X").setValue("V") = 给控件设初始值 → 当作参数默认值;
+    - click 里拼 op=export&format=excel 的 URL = 导出按钮,SightReport 报表自带导出。"""
+    unknown, setv, export = False, {}, False
     for lis in inner.iter():
-        if local(lis.tag) == "Content":
-            t = "".join(lis.itertext()).strip()
-            if t and t != "null" and not t.lstrip().startswith("//"):
-                return True
-    return False
+        if local(lis.tag) != "Content":
+            continue
+        t = "".join(lis.itertext()).strip()
+        if not t or t == "null" or t.lstrip().startswith("//"):
+            continue
+        flat = re.sub(r"\s+", " ", t)
+        if _JS_COSMETIC.match(flat):
+            continue
+        stm = [x.strip() for x in re.split(r";\s*", flat) if x.strip()]
+        ms = [_JS_SETVAL.match(x + ";") for x in stm]
+        if stm and all(ms):
+            for m in ms:
+                setv[m.group(1)] = m.group(2)
+            continue
+        if "op=export" in flat and "format=excel" in flat:
+            export = True
+            continue
+        unknown = True
+    return unknown, setv, export
+
+
+def _has_real_js(inner):
+    return _js_classify(inner)[0]
 
 
 def _widget_text(inner):
@@ -1310,6 +1407,8 @@ def _synth_db_dictionary(dic, name, datasets, ds_used):
     vi = (db.get("viName") or "").strip()          # 显示字段(列名)
     ki = (db.get("kiName") or "").strip() or vi    # 值字段,缺省同显示
     if not tbl or not vi:                           # 没有表或显示字段名→无法建 SQL
+        if not tbl and not vi and not ki:           # 帆软默认的空字典(什么都没配):等于没设值映射,不用提示
+            return "EMPTY"
         return None
     cn = next((e for e in dic.iter() if local(e.tag) == "DatabaseName"), None)
     conn = ("".join(cn.itertext()).strip() if cn is not None else "") or None
@@ -1467,10 +1566,20 @@ def _fill_options(inner, comp, ds_used, issues=None, name="", datasets=None):
             "valueField": (fda.get("kiName") if fda is not None else "") or ""}
         if dsname:
             ds_used.add(dsname)
+            if datasets is not None and dsname not in datasets and _PUBLIC["on"]:
+                _note_public_ref(dsname, name, (fda.get("kiName") if fda is not None else "") or "",
+                                 (fda.get("viName") if fda is not None else "") or "")
+            elif datasets is not None and dsname not in datasets and issues is not None:
+                issues.append(Issue("manual", "查询面板:" + (name or "下拉"),
+                                    "下拉字典引用「服务器数据集」%s,其定义不在 .cpt 内,下拉会没有选项;"
+                                    "请提供帆软服务器数据集文件(配置 server_datasets)后重转,或手工建同名数据集"
+                                    % dsname))
     elif "DatabaseDictionary" in dcls:
         # 直连表字典:自动合成「SELECT DISTINCT 显示[,值] FROM 表」数据集并接 datasetBinding,
         # 走既有 conn_map(连接映射一次即生效)+大字典→remote 序列化。无法建 SQL 时退回手工提示。
         syn = _synth_db_dictionary(dic, name, datasets, ds_used)
+        if syn == "EMPTY":
+            syn = None
         if syn is not None:
             binding, dn, sql, conn = syn
             comp["props"]["optionsBindingType"] = "dataset"
@@ -1566,7 +1675,7 @@ def _parse_cell(C, cells, styles, datasets, issues):
             "kind": "empty", "text": "", "dsName": None, "field": None,
             "agg": None, "expand": "none", "left": "default", "top": "default",
             "highlights": []}
-    O = Expand = HList = None
+    O = Expand = HList = Pres = LinkG = None
     for ch in C:
         lt = local(ch.tag)
         if lt == "O" and O is None:
@@ -1575,7 +1684,15 @@ def _parse_cell(C, cells, styles, datasets, issues):
             Expand = ch
         elif lt == "HighlightList":
             HList = ch
+        elif lt == "Present":
+            Pres = ch
+        elif lt == "NameJavaScriptGroup":
+            LinkG = ch
     _parse_cell_content(O, cell, datasets, issues)
+    if Pres is not None:
+        _parse_present(Pres, cell, datasets, issues)
+    if LinkG is not None:
+        _parse_cell_links(LinkG, cell, issues)
     if Expand is not None:
         cell["expand"] = {"0": "down", "1": "right"}.get(Expand.get("dir"), "none")
         # 帆软显式父格(leftParentDefault=false → left;upParentDefault=false → up)
@@ -1734,7 +1851,338 @@ def _parse_hl_action(action):
                     color = fr_color_to_hex(x.get("color"))
                     break
         return {"type": "color", "scope": scope, "color": color} if color else None
-    return None  # ValueHighlightAction / ColWidth 等暂不支持
+    if "ValueHighlightAction" in cls:
+        # 「条件成立时把显示值替换成 X」(常见:空值显示 0)→ renderItem newValue(值是表达式)
+        o = next((x for x in action if local(x.tag) == "O"), None)
+        if o is None:
+            return None
+        val = "".join(o.itertext()).strip()
+        if (o.get("t") or "") == "Formula":
+            nv, unk = translate_expression(val if val.startswith("=") else "=" + val)
+            if unk:
+                return None
+            nv = nv[1:] if nv.startswith("=") else nv
+            nv = nv[1:] if nv.startswith("=") else nv
+        elif re.fullmatch(r"-?\d+(\.\d+)?", val):
+            nv = val
+        else:
+            nv = '"%s"' % val.replace("\\", "\\\\").replace('"', '\\"')
+        return {"type": "newValue", "scope": "cell", "newValue": nv}
+    return None  # ColWidth 等暂不支持
+
+
+
+# ----------------------------------------------------------------------------
+# 单元格:字典(Present)/ 超链接 / 数据列过滤 / 内嵌图表
+# ----------------------------------------------------------------------------
+def _parse_present(P, cell, datasets, issues):
+    """单元格「呈现」(Present):DictPresent=把存的代码显示成名称(帆软「数据字典」)→ 值映射 facade。
+    原先整段静默丢弃 → 报表里本该显示名称的列(科室/医生/类型…)会直接显示代码,且无任何提示。"""
+    where = cellref(cell["r"], cell["c"])
+    cls = P.get("class", "")
+    if "DictPresent" not in cls:
+        if len(P) > 0 or "FormulaPresent" not in cls:      # 空 FormulaPresent 无内容,忽略
+            issues.append(Issue("manual", where, "单元格呈现 %s 未转换,需手工在单元格「值映射/格式」里配置"
+                                % cls.rsplit(".", 1)[-1]))
+        return
+    dic = next((e for e in P if local(e.tag) == "Dictionary"), None)
+    if dic is None:
+        return
+    dcls = dic.get("class", "")
+    if "CustomDictionary" in dcls:
+        items = [{"value": d.get("key"), "label": d.get("value")}
+                 for d in dic.iter() if local(d.tag) == "Dict"]
+        if items:
+            cell["mapping"] = {"type": "custom", "items": items}
+    elif "TableDataDictionary" in dcls:
+        fda = next((e for e in dic.iter() if local(e.tag) == "FormulaDictAttr"), None)
+        dsname = next(("".join(t.itertext()).strip() for t in dic.iter()
+                       if local(t.tag) == "Name"), "")
+        ki = (fda.get("kiName") if fda is not None else "") or ""
+        vi = (fda.get("viName") if fda is not None else "") or ""
+        if dsname and dsname in datasets:
+            fl = dict(datasets[dsname].get("fields") or {})
+            try:
+                fl.update({k: "String" for k in (fields_from_sql(datasets[dsname].get("sql") or "") or {})})
+            except Exception:
+                pass
+            declared = dict(datasets[dsname].get("fields") or {})
+            low = {k.lower(): k for k in fl}
+            low.update({k.lower(): k for k in declared})          # 以数据集实际声明的字段名大小写为准
+            if ki and ki.lower() in low:                          # 帆软字典列名大小写与数据集不一致(如 INFOCODE ↔ infocode)
+                ki = low[ki.lower()]
+            if vi and vi.lower() in low:
+                vi = low[vi.lower()]
+            try:
+                _known = bool(fields_from_sql(datasets[dsname].get("sql") or ""))   # SELECT * 时列不可知,不能判定映射无效
+            except Exception:
+                _known = False
+            if _known and ((ki and ki not in fl) or (vi and vi not in fl)):
+                # 字典指向的列在数据集里根本不存在(原报表里这个映射本身就失效,帆软显示原值)
+                issues.append(Issue("manual", where,
+                                    "单元格字典「%s」的值/显示字段(%s→%s)不在该数据集的列里,原报表此映射即无效,已不转值映射"
+                                    % (dsname, ki, vi)))
+                return
+            cell["mapping"] = {"type": "dataset", "dataset": dsname,
+                               "valueField": ki, "labelField": vi or ki}
+        elif dsname and _PUBLIC["on"]:
+            cell["mapping"] = {"type": "dataset", "dataset": dsname,
+                               "valueField": ki, "labelField": vi or ki, "public": True}
+            _note_public_ref(dsname, where, ki, vi or ki)
+        else:
+            issues.append(Issue("manual", where,
+                                "单元格字典引用「服务器数据集」%s(值字段 %s→显示字段 %s),其定义不在 .cpt 内;"
+                                "请提供帆软服务器数据集文件(配置 server_datasets),或在目标系统建同名辅助数据集后"
+                                "于该格配「值映射」,否则这一列会显示代码而非名称"
+                                % (dsname or "?", ki, vi)))
+    elif "DatabaseDictionary" in dcls:
+        syn = _synth_db_dictionary(dic, "cell_" + where, datasets, set())
+        if syn == "EMPTY":
+            return
+        if syn is not None:
+            binding, dn, sql, conn = syn
+            cell["mapping"] = {"type": "dataset", "dataset": dn,
+                               "valueField": binding["valueField"],
+                               "labelField": binding["labelField"]}
+            issues.append(Issue("info", where, "单元格字典已自动建数据集 %s(%s)并转为值映射" % (dn, sql)))
+        else:
+            issues.append(Issue("manual", where, "单元格 DatabaseDictionary 缺表名/字段名,无法自动转值映射"))
+    else:
+        issues.append(Issue("manual", where, "单元格字典类型 %s 暂不支持,需手工配置值映射"
+                            % dcls.rsplit(".", 1)[-1]))
+
+
+_LINK_TARGET = {"_blank": "blank", "_self": "self", "_dialog": "dialog", "_parent": "self",
+                "_top": "self"}
+
+
+def _link_param_value(o):
+    """链接参数的 <O> → (值, 是否表达式)。公式里的裸单元格引用统一转大写(帆软容忍小写 c3)。"""
+    if o is None:
+        return "", False
+    if "Formula" in o.get("class", "") or o.get("t") == "Formula":
+        raw = "".join(next((e for e in o if local(e.tag) == "Attributes"), o)
+                      .itertext()).strip().lstrip("=").strip()
+        if re.fullmatch(r"[A-Za-z]{1,2}\d+", raw):
+            raw = raw.upper()
+        return translate_expression(raw)[0], True
+    return "".join(o.itertext()).strip(), False
+
+
+def _parse_cell_links(G, cell, issues):
+    """NameJavaScriptGroup(单元格超链接)→ cell['links']。原先整段静默丢弃(钻取/跳转全部失效)。"""
+    where = cellref(cell["r"], cell["c"])
+    for njs in G:
+        if local(njs.tag) != "NameJavaScript":
+            continue
+        cand = [e for e in njs.iter() if local(e.tag) == "JavaScript"]
+        js = cand[-1] if cand else None          # 帆软把同类 JavaScript 嵌套两层,取最内层
+        if js is None:
+            continue
+        cls = js.get("class", "").rsplit(".", 1)[-1]
+        params = []
+        for p in js.iter():
+            if local(p.tag) != "Parameter":
+                continue
+            pn = next((a.get("name") for a in p if local(a.tag) == "Attributes"), None)
+            o = next((x for x in p if local(x.tag) == "O"), None)
+            if pn:
+                v, is_expr = _link_param_value(o)
+                params.append({"name": pn, "value": v, "expr": is_expr})
+        frame = _child_text(js, "TargetFrame") or ""
+        feat = next((e for e in js if local(e.tag) == "Features"), None)
+        link = {"name": njs.get("name") or "", "params": params,
+                "target": _LINK_TARGET.get(frame.strip(), "dialog" if frame.strip() else "blank"),
+                "width": feat.get("width") if feat is not None else None,
+                "height": feat.get("height") if feat is not None else None}
+        if cls == "ReportletHyperlink":
+            rn = next((e for e in js if local(e.tag) == "ReportletName"), None)
+            path = ("".join(rn.itertext()).strip() if rn is not None else "")
+            base, _, query = path.partition("&")
+            for kv in query.split("&"):                  # 目标路径后挂的 &k=v(op=view 是帆软视图开关,丢)
+                k, _, v = kv.partition("=")
+                if k and k != "op" and not any(p["name"] == k for p in params):
+                    params.append({"name": k, "value": v, "expr": False})
+            fn = base.replace("\\", "/").rsplit("/", 1)[-1]
+            link.update(type="report", path=base, fileName=os.path.splitext(fn)[0],
+                        ext=os.path.splitext(fn)[1].lower(),
+                        inherit=(rn is not None and rn.get("extendParameters") == "true"))
+        elif cls == "WebHyperlink":
+            link.update(type="web", url=_child_text(js, "URL") or "")
+        else:
+            issues.append(Issue("manual", where, "单元格链接类型 %s(%s)暂不支持,需手工配置链接"
+                                % (cls, njs.get("name") or "")))
+            continue
+        cell.setdefault("links", []).append(link)
+
+
+# 帆软 Compare op 码 → magic 过滤运算符(与 _CMP_OP 同口径:0-5 数值/等值比较)
+_FILTER_OP = {"0": "equals", "1": "notEquals", "2": "greatThen", "3": "equalsGreatThen",
+              "4": "lessThen", "5": "equalsLessThen"}
+
+
+def _parse_data_filter(cond, cell, issues):
+    """DSColumn 的 <Condition>(单元格「过滤」):只有 CommonCondition(字段 op 单元格/常量)能确定翻译。
+    原先整段静默丢弃 → 该列不再按 E2 等单元格筛选,数据范围变大且无提示。"""
+    where = cellref(cell["r"], cell["c"])
+    cls = cond.get("class", "")
+    if "ListCondition" in cls and len(cond) == 0:        # 空条件 = 无过滤
+        return
+    if "CommonCondition" in cls:
+        cname = _child_text(cond, "CNAME")
+        cp = next((e for e in cond if local(e.tag) == "Compare"), None)
+        op = _FILTER_OP.get(cp.get("op")) if cp is not None else None
+        right = None
+        if cp is not None:
+            for ch in cp:
+                lt = local(ch.tag)
+                if lt == "ColumnRow":
+                    try:
+                        right = ("Cell", "%s%d" % (col_letter(int(ch.get("column")) + 1),
+                                                   int(ch.get("row")) + 1))
+                    except (TypeError, ValueError):
+                        pass
+                elif lt == "O":
+                    txt = "".join(ch.itertext()).strip()
+                    if "Formula" in ch.get("class", "") or ch.get("t") == "Formula":
+                        right = ("Expression", translate_expression(txt.lstrip("=").strip())[0])
+                    elif (ch.get("t") or "").upper() in ("I", "L", "D", "F", "N") \
+                            and re.fullmatch(r"-?\d+(\.\d+)?", txt or ""):
+                        right = ("Number", txt)
+                    else:
+                        right = ("String", txt)
+                break
+        if cname and op and right:
+            cell.setdefault("filters", []).append(
+                {"left": cname, "op": op, "rtype": right[0], "right": right[1]})
+            return
+    issues.append(Issue("manual", where,
+                        "数据列过滤条件(%s)未能自动转换,需在单元格「过滤条件」手工配,否则该列不按条件筛选"
+                        % cls.rsplit(".", 1)[-1]))
+
+
+# VanChart Plot → (chartType, 子类型/附加)
+_CHART_PLOT = {"VanChartColumnPlot": ("bar", None), "VanChartBarPlot": ("bar", "horizontal"),
+               "VanChartLinePlot": ("line", None), "VanChartAreaPlot": ("line", "area"),
+               "PiePlot4VanChart": ("pie", None)}
+_CHART_PLOT_CN = {"bar": "柱形图", "line": "折线图", "pie": "饼图"}
+
+
+def defn_dataset_name(defn):
+    """图表数据定义里「真正的数据集名」= 其直接子元素 TableData 下的 Name。
+    不能 iter() 取第一个 Name:Top/CategoryPresent|SeriesPresent 里的字典 TableData 排在前面,会取到字典表。"""
+    if defn is None:
+        return ""
+    for td in defn:
+        if local(td.tag) == "TableData":
+            nm = next((t for t in td.iter() if local(t.tag) == "Name"), None)
+            if nm is not None:
+                return "".join(nm.itertext()).strip()
+    return ""
+
+
+def _chart_summary(ch):
+    """从 <Chart> 提取(图表类型名, 数据集名, 数据定义元素, 标题)。"""
+    plot = next((e for e in ch.iter() if local(e.tag) == "Plot"), None)
+    pcls = plot.get("class", "").rsplit(".", 1)[-1] if plot is not None else "?"
+    cd = next((e for e in ch.iter() if local(e.tag) == "ChartDefinition"), None)
+    defn = next(iter(cd), None) if cd is not None else None
+    ds = ""
+    if defn is not None:
+        ds = defn_dataset_name(defn) or next(
+            ("".join(t.itertext()).strip() for t in defn.iter() if local(t.tag) == "Name"), "")
+    title = ""
+    for t4 in ch.iter():
+        if local(t4.tag) == "Title4VanChart":
+            o = next((e for e in t4.iter() if local(e.tag) == "O"), None)
+            title = ("".join(o.itertext()).strip() if o is not None else "")
+            break
+    return pcls, ds, defn, title
+
+
+def _vanchart_to_content(ch, datasets):
+    """帆软 VanChart → sight 单元格 <chartContent>(ECharts 配置)。
+    返回 (xml 或 None, 描述, 数据集名, 备注列表)。仅覆盖 柱/折线/面积/饼 的 OneValue/MoreName 数据定义;
+    其余返回 None 交人工(不猜)。"""
+    pcls, ds, defn, title = _chart_summary(ch)
+    notes = []
+    if pcls not in _CHART_PLOT or defn is None:
+        return None, "VanChart:%s" % pcls, ds, notes
+    ctype, sub = _CHART_PLOT[pcls]
+    dname = local(defn.tag)
+    cat = _child_attr(defn, "CategoryName", "value") or ""
+    if cat in ("无",):
+        cat = ""
+    cfg = {"chartType": ctype, "dataSourceType": "dataset"}
+    if sub == "horizontal":
+        cfg["chartSubType"] = "horizontal"
+    dsc = {"datasetName": ds}
+    if dname == "OneValueCDDefinition":
+        sname, vname = defn.get("seriesName") or "", defn.get("valueName") or ""
+        if ctype == "pie":
+            dsc["categoryField"] = cat or sname
+            dsc["seriesNameMode"] = "fieldName"
+            dsc["fieldNameConfig"] = [{"name": vname, "dataField": vname, "aggregationType": "sum"}]
+        elif cat and sname and sname != cat:
+            dsc["categoryField"] = cat
+            dsc["seriesNameMode"] = "fieldValue"
+            dsc["fieldValueConfig"] = {"nameField": sname, "dataField": vname, "aggregationType": "sum"}
+        else:
+            dsc["categoryField"] = cat or sname
+            dsc["seriesNameMode"] = "fieldName"
+            dsc["fieldNameConfig"] = [{"name": vname, "dataField": vname, "aggregationType": "sum"}]
+        if any(local(e.tag) == "SeriesPresent" for e in defn.iter()):
+            notes.append("系列名带字典翻译(SeriesPresent),图例/扇区将显示代码,需手工配值映射")
+    elif dname == "MoreNameCDDefinition" and ctype != "pie":
+        cols = [e for e in defn if local(e.tag) == "ChartSummaryColumn"]
+        if not cols:
+            return None, "VanChart:%s" % pcls, ds, notes
+        dsc["categoryField"] = cat
+        dsc["seriesNameMode"] = "fieldName"
+        dsc["fieldNameConfig"] = [{"name": c.get("customName") or c.get("name"),
+                                   "dataField": c.get("name"), "aggregationType": "sum"}
+                                  for c in cols]
+        if not cat:
+            notes.append("原图表无分类字段(单行多指标),已按指标名作系列;需确认显示效果")
+    else:
+        return None, "VanChart:%s/%s" % (pcls, dname), ds, notes
+    cfg["datasetConfig"] = dsc
+    cfg["commonSeriesOption"] = ({"areaStyle": {}} if sub == "area" else {})
+    opt = {"tooltip": {"trigger": "item" if ctype == "pie" else "axis"}}
+    if title:
+        opt["title"] = {"show": True, "text": title}
+    if ctype in ("bar", "line"):
+        opt["xAxis"] = {"type": "category"} if sub != "horizontal" else {"type": "value"}
+        opt["yAxis"] = {"type": "value"} if sub != "horizontal" else {"type": "category"}
+    xml = ("<config><![CDATA[%s]]></config><option><![CDATA[%s]]></option>"
+           % (json.dumps(cfg, ensure_ascii=False), json.dumps(opt, ensure_ascii=False)))
+    return xml, _CHART_PLOT_CN.get(ctype, ctype), ds, notes
+
+
+def _parse_chart_cell(O, cell, datasets, issues):
+    """单元格内嵌图表(<O t="CC">)。原先走通用分支,把整段图表 XML 的文字(标题+数字格式串…)
+    当成单元格文本输出 → 版面里出现一坨乱码文字且图表丢失,报告无提示。"""
+    where = cellref(cell["r"], cell["c"])
+    ch = next((e for e in O if local(e.tag) == "Chart"), None)
+    inner = next((e for e in ch if local(e.tag) == "Chart"), ch) if ch is not None else None
+    res = _vanchart_to_content(inner, datasets) if inner is not None else (None, "未知", "", [])
+    xml, desc, ds, notes = res
+    if xml is not None:
+        cell.update(kind="chart", chart_xml=xml, dsName=None, chart_ds=ds)
+        issues.append(Issue("info", where,
+                            "内嵌图表(%s,数据集 %s)已自动转为 ECharts 图表,样式(配色/标签/图例)未还原,"
+                            "导入后请在设计器核对%s" % (desc, ds or "?",
+                                                         ("；" + "；".join(notes)) if notes else "")))
+        if ds and ds not in datasets:
+            if _PUBLIC["on"]:
+                _note_public_ref(ds, where)
+            else:
+                issues.append(Issue("manual", where, "图表引用的数据集「%s」不在 .cpt 内(服务器数据集),需补充" % ds))
+    else:
+        cell.update(kind="text", text="[图表待配置:%s,数据集 %s]" % (desc, ds or "?"))
+        issues.append(Issue("manual", where,
+                            "内嵌图表(%s,数据集 %s)暂无法自动转换,已留占位文本;需在设计器手工建图表"
+                            % (desc, ds or "?")))
 
 
 def _parse_cell_content(O, cell, datasets, issues):
@@ -1742,6 +2190,9 @@ def _parse_cell_content(O, cell, datasets, issues):
         return
     t = O.get("t")
     cls = O.get("class", "")
+    if t == "CC":
+        _parse_chart_cell(O, cell, datasets, issues)
+        return
     if t == "DSColumn":
         attrs = next((ch for ch in O if local(ch.tag) == "Attributes"), None)
         dsName = attrs.get("dsName") if attrs is not None else None
@@ -1756,6 +2207,9 @@ def _parse_cell_content(O, cell, datasets, issues):
                 else:
                     agg = "group"
         cell.update(kind="dataset", dsName=dsName, field=field, agg=agg)
+        for _cd in O:
+            if local(_cd.tag) == "Condition":
+                _parse_data_filter(_cd, cell, issues)
         if dsName in datasets and field:
             cur = datasets[dsName]["fields"].get(field, "String")
             datasets[dsName]["fields"][field] = (
@@ -1770,6 +2224,13 @@ def _parse_cell_content(O, cell, datasets, issues):
             _set_expression(cell, txt[1:].strip(), issues)
         else:
             cell.update(kind="text", text=txt)
+        if t == "BiasTextPainter" and "|" in txt and not txt.startswith("="):
+            parts = [p.strip() for p in txt.split("|")]
+            if len(parts) >= 2 and any(parts):
+                cell["items"] = parts                    # 斜线表头:第一项右上 → 最后一项左下
+                issues.append(Issue("info", cellref(cell["r"], cell["c"]),
+                                    "帆软斜线头「%s」已转为斜线表头单元格(SightReport 斜线固定为左上→右下)" % txt))
+                return
         if t in ("RichText", "BiasTextPainter"):
             issues.append(Issue("manual", cellref(cell["r"], cell["c"]),
                                 "帆软富文本/斜线头(%s)仅提取纯文本,样式需手工还原" % t))
@@ -1909,6 +2370,14 @@ def trim_empty_grid(cells, row_h, col_w):
         if nc2.get("highlights"):
             nc2["highlights"] = [dict(h, expr=_remap_refs(h.get("expr", "")))
                                  for h in nc2["highlights"]]
+        if nc2.get("links"):
+            nc2["links"] = [dict(lk, params=[
+                dict(p, value=_remap_refs(p["value"]) if p["expr"] else p["value"])
+                for p in lk["params"]]) for lk in nc2["links"]]
+        if nc2.get("filters"):
+            nc2["filters"] = [dict(f, right=(name_remap.get(f["right"], f["right"])
+                                             if f["rtype"] == "Cell" else f["right"]))
+                              for f in nc2["filters"]]
         new_cells[(nr, nc)] = nc2
     new_row_h = {row_map[r]: h for r, h in (row_h or {}).items() if r in keep_rows}
     new_col_w = {col_map[c]: w for c, w in (col_w or {}).items() if c in keep_cols}
@@ -1986,6 +2455,46 @@ def fields_from_sql(sql):
 # ----------------------------------------------------------------------------
 # 单个 sheet → sight-report 网格报表 XML
 # ----------------------------------------------------------------------------
+def _cells_used_ds(cells):
+    """网格实际引用的数据集:数据列绑定 + 单元格字典(值映射)+ 内嵌图表。"""
+    used = set()
+    for c in cells:
+        if c.get("dsName"):
+            used.add(c["dsName"])
+        m = c.get("mapping")
+        if m and m.get("type") == "dataset":
+            used.add(m["dataset"])
+        if c.get("chart_ds"):
+            used.add(c["chart_ds"])
+    return used
+
+
+def _report_link_issues(cells, cfg, issues):
+    """钻取链接目标:转换后目标报表的 fileId 在目标系统才有,转换时无从得知 → 汇总提示。"""
+    fmap = cfg.get("link_file_map") or {}
+    seen = {}
+    for c in cells:
+        for lk in c.get("links", []):
+            if lk["type"] != "report" or lk.get("embed_id"):
+                continue
+            if lk.get("ext") == ".frm":
+                if (lk.get("path") in fmap) or (lk.get("fileName") in fmap):
+                    continue
+                issues.append(Issue("manual", cellref(c["r"], c["c"]),
+                                    "钻取目标「%s」是决策报表(.frm),本工具会把它转成仪表盘 .mrs,但网格单元格不能内嵌仪表盘;"
+                                    "导入后请在链接里选该仪表盘,或在 link_file_map 里配它的 fileId 后重转"
+                                    % lk["path"]))
+            elif (lk.get("path") not in fmap) and (lk.get("fileName") not in fmap):
+                seen.setdefault(lk["path"], []).append(cellref(c["r"], c["c"]))
+    for path, where in seen.items():
+        issues.append(Issue("manual", ",".join(where[:3]) + ("…" if len(where) > 3 else ""),
+                            ("钻取链接目标「%s」不在输入目录内,无法内置;把目标 .cpt 放进输入目录重转即可内置,"
+                             "或导入后在设计器链接里选目标报表(链接现只带报表名和参数)" % path)
+                            if cfg.get("embed_drill", True) and cfg.get("_input_root") else
+                            ("钻取链接目标「%s」:目标报表的 fileId 要导入后才有,链接只带了报表名(fileName)"
+                             "和参数;请在设计器链接里选择目标报表,或配置 link_file_map 后重转" % path)))
+
+
 def _process_grid(sm, cfg, issues):
     """网格级处理(裁空、引用撑格、父格纠偏、日期公式包裹),返回处理后网格与几何。
     单 sheet 与多页签(每 sheet)共用此函数,保证两条路网格语义完全一致。"""
@@ -2169,9 +2678,10 @@ def _process_grid(sm, cfg, issues):
                          or cell["c"] + cell["cs"] > _expand_col)):
                 cell["col_stretch"] = True
 
+    _report_link_issues(cells.values(), cfg, issues)
     conn_map = cfg["connection_map"]
     query = sm.get("query")
-    used_ds = {c["dsName"] for c in cells.values() if c.get("dsName")}
+    used_ds = _cells_used_ds(cells.values())
     if query:
         used_ds |= query.get("ds_used", set())   # 下拉字典绑定的数据集也要 emit
 
@@ -2212,21 +2722,25 @@ def _emit_report_head(out, sm, cfg, issues, used_ds):
     """发射报表级共享节点:dataset / pageSetting / setting / parameter / queryFormSetting。
     多页签下这些节点在根级只出现一次(datasets/params 为各 sheet 的并集)。"""
     query = sm.get("query")
+    _qx = sm.get("query_extra") or {"meta": {}, "components": []}
+    _meta_all = dict(_qx["meta"])                       # 内置钻取目标的参数类型/默认值(本报表优先)
+    _meta_all.update((query or {}).get("meta", {}))
+    _comps_all = list((query or {}).get("components", [])) + list(_qx["components"])
     conn_map = cfg["connection_map"]
     date_fmt = {}
-    if query and query.get("meta"):
+    if _meta_all:
         _DATE_PAT = {"Date": "yyyy-MM-dd", "DateTime": "yyyy-MM-dd HH:mm:ss"}
         date_fmt = {n: _DATE_PAT[m["datatype"]]
-                    for n, m in query["meta"].items()
+                    for n, m in _meta_all.items()
                     if m.get("datatype") in _DATE_PAT}
     # 列选择型参数集合(值为 a.记账日期 这类列引用):SQL 翻译时这些参数走 #{} 内联而非 ${} 绑定。
     ident_params = set()
-    _qmeta = (query or {}).get("meta", {})
+    _qmeta = _meta_all
     for _pn, _pm in _qmeta.items():
         _dv = _pm.get("default")
         if _dv and _COL_IDENT.match(str(_dv)):
             ident_params.add(_pn)
-    for _c in (query or {}).get("components", []):
+    for _c in _comps_all:
         _pn = _c.get("parameterName") or _c.get("name")
         _opts = (_c.get("props") or {}).get("customBinding") or []
         if _pn and _opts and all(_COL_IDENT.match(str((o or {}).get("value", ""))) for o in _opts):
@@ -2245,7 +2759,7 @@ def _emit_report_head(out, sm, cfg, issues, used_ds):
     # ②查询组件是日期/时间选择器(运行时传 Date 对象,内联会得 Date.toString 非法串)。
     # 字符串型选择器(radio/select,如 riqi=计费日期、endTime=某选项)值是字符串,可安全内联。
     date_param_set = set(date_fmt)
-    for _c in (query or {}).get("components", []):
+    for _c in _comps_all:
         if (_c.get("type") or "") in ("date", "datetime", "time", "daterange", "datetimerange"):
             _dn = _c.get("parameterName") or _c.get("name")
             if _dn:
@@ -2255,7 +2769,7 @@ def _emit_report_head(out, sm, cfg, issues, used_ds):
     # 仅 ComboCheckBox→multiselect / CheckBox(Group)→checkbox。单选 ComboBox→select 是
     # String,String 上没有 join 扩展方法(见 translate_sql 内注释),不可走 join 分支。
     multi_param_set = set()
-    for _c in (query or {}).get("components", []):
+    for _c in _comps_all:
         if (_c.get("type") or "") in ("multiselect", "checkbox"):
             _mn = _c.get("parameterName") or _c.get("name")
             if _mn:
@@ -2266,7 +2780,7 @@ def _emit_report_head(out, sm, cfg, issues, used_ds):
     # (控件侧只是它的一种来源),这样纯参数声明成 Boolean 而无对应控件时也照样成立。
     bool_param_set = {_pn for _pn, _pm in _qmeta.items()
                       if str(_pm.get("datatype") or "") == "Boolean"}
-    for _c in (query or {}).get("components", []):
+    for _c in _comps_all:
         if (_c.get("type") or "") == "switch":
             _bn = _c.get("parameterName") or _c.get("name")
             if _bn:
@@ -2275,7 +2789,7 @@ def _emit_report_head(out, sm, cfg, issues, used_ds):
     di = 0
     _unmapped_seen = set()      # 每个连接每张报表只提示一次(同连接多数据集=同一次映射解决)
     for dsName, ds in sm["datasets"].items():
-        if used_ds and dsName not in used_ds:
+        if (used_ds and dsName not in used_ds) or (ds.get("_server") and dsName not in used_ds):
             continue
         di += 1
         conn = ds.get("conn")
@@ -2290,10 +2804,11 @@ def _emit_report_head(out, sm, cfg, issues, used_ds):
         ds_conn_name = ds_conn_name.strip()
         if conn and conn not in conn_map and conn not in _unmapped_seen:
             _unmapped_seen.add(conn)
-            issues.append(Issue("manual", "连接:" + conn,
-                                "帆软连接「%s」未在转换器显式映射,已默认使用同名数据连接「%s」;"
-                                "若目标系统里的数据连接名称不同,请在映射表调整,映射一次即全部生效"
+            issues.append(Issue("info", "连接:" + conn,
+                                "帆软连接「%s」未在转换器显式映射,已默认使用同名数据连接「%s」(汇总见 _connections.txt)"
                                 % (conn, conn)))
+        if conn and conn not in conn_map:
+            _CONNS.setdefault(conn, set()).add(_PUBLIC["report"])
         # 数据集 id 用唯一的 ds_N;数据源只写 dataSourceName(后端按名称解析,无需 dataSourceId)
         da = ('xmlns="" id="ds_%d" name="%s" type="sql"'
               % (di, html.escape(dsName, quote=True)))
@@ -2304,6 +2819,8 @@ def _emit_report_head(out, sm, cfg, issues, used_ds):
                                          prequoted_params, date_param_set,
                                          multi_param_set, bool_param_set)
         out.append('        <sql>%s</sql>' % cdata(sql_out))
+        for sev, pr in sql_lint(ds.get("sql") or ""):
+            issues.append(Issue(sev, "数据集:" + dsName, "原 SQL " + pr))
         if sql_unk:
             issues.append(Issue("degraded", "数据集:" + dsName,
                                 "SQL 动态条件含未映射函数 %s,需复核"
@@ -2337,7 +2854,7 @@ def _emit_report_head(out, sm, cfg, issues, used_ds):
     out.append('        <background type="none" />')
     out.append('    </setting>')
     # 顺序:setting → parameter → queryFormSetting → row …(遵循 XSD)
-    meta = (query or {}).get("meta", {})
+    meta = _meta_all
     for pi, (pn, pv) in enumerate(sm["params"].items(), 1):
         m = meta.get(pn, {})
         dt = m.get("datatype") or (
@@ -2378,23 +2895,56 @@ def _emit_grid_lines(out, sm, cfg, cells, subordinate, max_r, max_c):
                    'hidden="false" lock="false"%s />'
                    % (c, c, round(w / div, 2) if w else 100, _auto_width_attrs(cfg)))
 
+    for _cell in cells.values():                         # 值映射字段名大小写对齐到数据集最终声明的字段
+        _m = _cell.get("mapping")
+        if _m and _m.get("type") == "dataset" and _m["dataset"] in (sm.get("datasets") or {}):
+            _low = {k.lower(): k for k in sm["datasets"][_m["dataset"]].get("fields") or {}}
+            for _k in ("labelField", "valueField"):
+                if _m.get(_k) and _m[_k].lower() in _low:
+                    _m[_k] = _low[_m[_k].lower()]
+                elif _m.get(_k):                              # SELECT * 的数据集:映射用到的列补进声明字段
+                    sm["datasets"][_m["dataset"]].setdefault("fields", {})[_m[_k]] = "String"
     for r in range(max_r):
         for c in range(max_c):
             if (r, c) in cells and (r, c) not in subordinate:
-                out.append(_emit_cell(cells[(r, c)], cfg))
+                _cl = cells[(r, c)]
+                if _cl.get("items"):                      # 斜线表头需要单元格实际宽高
+                    _cl["_w"] = sum((sm["col_w"].get(cc) or 100 * div) for cc in range(c, c + _cl["cs"])) / div
+                    _cl["_h"] = sum((sm["row_h"].get(rr) or 30 * div) for rr in range(r, r + _cl["rs"])) / div
+                out.append(_emit_cell(_cl, cfg))
             elif (r, c) in subordinate:
                 out.append(_emit_placeholder(r, c, "false", 0, 0))
             else:
                 out.append(_emit_placeholder(r, c, "true", 1, 1))
 
 
+def _emit_embeds(out, embeds, cfg):
+    """内嵌子报表(钻取内置)。每个 embeddedReport 自带 row/col/cell,数据集/参数共用主报表的。"""
+    if not embeds:
+        return
+    out.append('    <embeddedReports xmlns="">')
+    for e in embeds:
+        out.append('        <embeddedReport id="%s" name="%s">'
+                   % (e["id"], html.escape(e["name"], quote=True)))
+        lines = []
+        p = e["proc"]
+        _emit_grid_lines(lines, p["sm"], cfg, p["cells"], p["subordinate"], p["max_r"], p["max_c"])
+        for ln in lines:
+            out.append(re.sub(r'(<(?:row|col) xmlns="" id=")(row|col)_',
+                              r'\g<1>%s_\g<2>_' % e["id"], ln))
+        out.append('        </embeddedReport>')
+    out.append('    </embeddedReports>')
+
+
 def map_to_xml(sm, cfg, issues):
+    emb = sm.get("embeds"), sm.get("embed_used"), sm.get("query_extra")
     proc = _process_grid(sm, cfg, issues)
-    sm = proc["sm"]
+    sm = dict(proc["sm"], embeds=emb[0], embed_used=emb[1], query_extra=emb[2])
     out = _report_open(sm, cfg, multi=False)
-    _emit_report_head(out, sm, cfg, issues, proc["used_ds"])
+    _emit_report_head(out, sm, cfg, issues, proc["used_ds"] | set(emb[1] or ()))
     _emit_grid_lines(out, sm, cfg, proc["cells"], proc["subordinate"],
                      proc["max_r"], proc["max_c"])
+    _emit_embeds(out, emb[0], cfg)
     out.append('</report>')
     return "\n".join(out)
 
@@ -2406,7 +2956,7 @@ def map_to_xml_multi(head_sm, sheets_proc, cfg, issues):
     for p in sheets_proc:
         union_used |= (p.get("used_ds") or set())
     out = _report_open(head_sm, cfg, multi=True)
-    _emit_report_head(out, head_sm, cfg, issues, union_used)
+    _emit_report_head(out, head_sm, cfg, issues, union_used | set(head_sm.get("embed_used") or ()))
     out.append('    <sheets xmlns="">')
     for p in sheets_proc:
         sid = html.escape(p["sheet_id"], quote=True)
@@ -2416,6 +2966,7 @@ def map_to_xml_multi(head_sm, sheets_proc, cfg, issues):
                          p["max_r"], p["max_c"])
         out.append('        </sheet>')
     out.append('    </sheets>')
+    _emit_embeds(out, head_sm.get("embeds"), cfg)
     out.append('</report>')
     return "\n".join(out)
 
@@ -2450,7 +3001,9 @@ def _emit_cell(cell, cfg):
     r, c = cell["r"], cell["c"]
     row, col = r + 1, c + 1
     style, kind = cell["style"], cell["kind"]
-    typ = {"dataset": "dataset", "expression": "expression"}.get(kind, "text")
+    typ = {"dataset": "dataset", "expression": "expression", "chart": "chart"}.get(kind, "text")
+    if cell.get("items") and kind == "text":
+        typ = "crosstab"
     a = {"row": row, "col": col, "name": "%s%d" % (col_letter(col), row),
          "colspan": cell["cs"], "rowspan": cell["rs"], "type": typ,
          "left": cell.get("left", "default"), "top": cell.get("top", "default")}
@@ -2494,12 +3047,36 @@ def _emit_cell(cell, cfg):
 
     wrap = _word_wrap(cfg)
     s = ['    <cell xmlns="" %s>' % attr(a)]
-    if kind == "dataset":
-        s.append('        <datasetContent %s />' % attr({
+    if typ == "crosstab":
+        w, h = cell.get("_w") or 0, cell.get("_h") or 0
+        ca = {"direction": "down"}
+        if w > 0 and h > 0:
+            ca["width"], ca["height"] = round(w, 2), round(h, 2)
+        s.append('        <crosstabContent %s>' % attr(ca))
+        for k, t_ in enumerate(cell["items"]):
+            s.append('            <item id="hdr_%d_%d_%d">%s</item>' % (row, col, k, cdata(t_)))
+        s.append('        </crosstabContent>')
+    elif kind == "dataset":
+        _da = attr({
             "dataset": cell["dsName"] or "", "field": cell["field"] or "",
             "wordWrap": wrap, "aggregateType": cell["agg"] or "select",
             "enabledParentCellFilter": "true", "enabledCollapse": "false",
-            "order": "none"}))
+            "order": "none"})
+        if cell.get("filters"):
+            s.append('        <datasetContent %s>' % _da)
+            s.append('            <filterCondition>')
+            for _i, _f in enumerate(cell["filters"]):
+                _ca = {"itemType": "common", "leftValue": _f["left"], "operator": _f["op"],
+                       "rightValueType": _f["rtype"], "rightValue": _f["right"]}
+                if _i:
+                    _ca = dict({"joinType": "and"}, **_ca)
+                s.append('                <condition %s />' % attr(_ca))
+            s.append('            </filterCondition>')
+            s.append('        </datasetContent>')
+        else:
+            s.append('        <datasetContent %s />' % _da)
+    elif kind == "chart":
+        s.append('        <chartContent>%s</chartContent>' % cell["chart_xml"])
     elif kind == "expression":
         s.append('        <expressionContent wordWrap="%s">%s'
                  '</expressionContent>' % (wrap, cdata(cell["text"])))
@@ -2510,6 +3087,7 @@ def _emit_cell(cell, cfg):
     if kind in ("dataset", "expression") and style and style.get("fmt_type"):
         s.append('        <format formatType="%s">%s</format>'
                  % (style["fmt_type"], cdata(style.get("fmt_pattern") or "")))
+    s.extend(_emit_mapping_and_links(cell, cfg, a["name"]))
     for hl in cell.get("highlights", []):
         s.append(_emit_render_item(hl))
     s.append(_borders(style))
@@ -2517,12 +3095,70 @@ def _emit_cell(cell, cfg):
     return "\n".join(s)
 
 
+def _emit_mapping_and_links(cell, cfg, cname):
+    """值映射 facade(单元格字典)与 <links>(超链接)。顺序遵循 XSD:facade → links。"""
+    out = []
+    m = cell.get("mapping")
+    if m and cell.get("kind") != "chart":
+        if m["type"] == "dataset":
+            out.append('        <facade %s />' % attr({
+                "type": "mapping", "mappingType": "dataset", "dataset": m["dataset"],
+                "labelField": m["labelField"], "valueField": m["valueField"],
+                "showOriginalValueOnMappingFail": "true"}))
+        else:
+            out.append('        <facade type="mapping" mappingType="custom" '
+                       'showOriginalValueOnMappingFail="true">')
+            for it in m["items"]:
+                # label/value 均必填(XSD),空串也要写出(attr() 会丢空值)
+                out.append('            <customMappingData label="%s" value="%s" />' % (
+                    html.escape(it["label"] or "", quote=True),
+                    html.escape(it["value"] or "", quote=True)))
+            out.append('        </facade>')
+    fmap = cfg.get("link_file_map") or {}
+    for i, lk in enumerate(cell.get("links", []), 1):
+        la = {"id": "lnk_%s_%d" % (cname, i), "name": lk["name"] or lk.get("fileName") or "链接%d" % i,
+              "type": lk["type"], "target": lk["target"]}
+        if lk["type"] == "web":
+            la["url"] = lk.get("url") or ""
+        elif lk.get("embed_id"):
+            la.update(embeddedReportId=lk["embed_id"], fileType="grid", openType="page",
+                      showQueryForm="false", title=lk.get("fileName") or "",
+                      inheritParameters="true" if lk.get("inherit") else "false")
+            for k in ("width", "height"):
+                if lk.get(k):
+                    la[k] = "%spx" % lk[k]
+            lk = dict(lk, width=None, height=None)
+        else:
+            la["fileName"] = lk.get("fileName") or ""
+            tgt = fmap.get(lk.get("path")) or fmap.get(lk.get("fileName")) or {}
+            if isinstance(tgt, str):
+                tgt = {"fileId": tgt}
+            for k in ("fileId", "fileCode", "fileType"):
+                if tgt.get(k):
+                    la[k] = tgt[k]
+            if lk.get("inherit"):
+                la["inheritParameters"] = "true"
+        if lk["target"] == "dialog":
+            if lk.get("width"):
+                la["width"] = lk["width"]
+            if lk.get("height"):
+                la["height"] = lk["height"]
+        out.append('        <links %s>' % attr(la))
+        for p in lk["params"]:
+            pa = {"name": p["name"], "value": p["value"]}
+            if p["expr"]:
+                pa["isExpression"] = "true"
+            out.append('            <parameter %s />' % attr(pa))
+        out.append('        </links>')
+    return out
+
+
 def _emit_render_item(hl):
     """条件渲染项 → <renderItem>(content 在 borders 之前,遵循 XSD)。"""
     contents = []
     for c in hl["contents"]:
         ca = {"type": c["type"], "scope": c.get("scope", "cell")}
-        for k in ("backgroundColor", "color", "bold", "italic"):
+        for k in ("backgroundColor", "color", "bold", "italic", "newValue"):
             if c.get(k):
                 ca[k] = c[k]
         contents.append('                <content %s />' % attr(ca))
@@ -2671,12 +3307,179 @@ def _resolve_dest(dest, subdir, base, overwrite):
     return base, rel, mrg, False
 
 
+_SERVER_DS_CACHE = {}
+_CPT_INDEX = {}
+
+
+def _resolve_embed_target(cfg, lk):
+    """链接目标 .cpt 路径 → 输入目录里的真实文件(先按相对根路径,再按文件名唯一匹配)。"""
+    root = cfg.get("_input_root")
+    if not root or lk.get("ext") != ".cpt":
+        return None
+    rel = (lk.get("path") or "").replace("\\", "/").lstrip("/")
+    cand = os.path.join(root, rel)
+    if os.path.isfile(cand):
+        return os.path.abspath(cand)
+    if root not in _CPT_INDEX:
+        idx = {}
+        for dp, _, fns in os.walk(root):
+            for fn in fns:
+                if fn.lower().endswith(".cpt"):
+                    idx.setdefault(fn, []).append(os.path.abspath(os.path.join(dp, fn)))
+        _CPT_INDEX[root] = idx
+    hits = _CPT_INDEX[root].get(os.path.basename(rel), [])
+    if len(hits) == 1:
+        return hits[0]
+    tails = [h for h in hits if h.replace("\\", "/").endswith(rel)]
+    return tails[0] if len(tails) == 1 else None
+
+
+def _rename_ds_in_cells(cells, ren):
+    for c in cells.values():
+        if c.get("dsName") in ren:
+            c["dsName"] = ren[c["dsName"]]
+        m = c.get("mapping")
+        if m and m.get("dataset") in ren:
+            m["dataset"] = ren[m["dataset"]]
+        if c.get("chart_ds") in ren:
+            new = ren[c["chart_ds"]]
+            c["chart_xml"] = c["chart_xml"].replace(
+                '"datasetName": "%s"' % c["chart_ds"], '"datasetName": "%s"' % new)
+            c["chart_ds"] = new
+
+
+def _attach_embeds(model, cfg):
+    """钻取内置:把链接指向的 .cpt 递归转成内嵌子报表。
+    ·目标的数据集并入本报表(同名同 SQL 复用,同名异 SQL 加后缀改名);目标查询面板不进来,
+      但其参数类型/默认值并入(仅用于 SQL 翻译与参数声明,且一律非必填)。
+    ·链接参数名需在本报表声明为参数,否则运行时被静默丢弃 → 登记到 embed_params。
+    返回需并入报表问题清单的 Issue 列表。"""
+    model.update(embeds=[], embed_used=set(), embed_params=set(),
+                 query_extra={"meta": {}, "components": []})
+    issues = []
+    if not cfg.get("embed_drill", True) or not cfg.get("_input_root"):
+        return issues
+    registry, maxd = {}, cfg.get("embed_max_depth", 3)
+
+    def visit(cells, depth, label):
+        for c in cells.values():
+            for lk in c.get("links", []):
+                if lk["type"] != "report" or lk.get("ext") != ".cpt":
+                    continue
+                tp = _resolve_embed_target(cfg, lk)
+                if not tp:
+                    continue
+                emb = build(tp, depth + 1)
+                if emb is None:
+                    issues.append(Issue("manual", "%s%s" % (label, cellref(c["r"], c["c"])),
+                                        "钻取目标「%s」未能内置(嵌套超过 %d 层或解析失败),链接只带报表名"
+                                        % (lk["path"], maxd)))
+                    continue
+                lk["embed_id"] = emb["id"]
+                for p in lk["params"]:
+                    model["embed_params"].add(p["name"])
+                sent = {p["name"] for p in lk["params"]}
+                miss = [n for n in emb["meta_names"] if n not in sent]
+                if miss and not lk.get("inherit"):
+                    issues.append(Issue("info", "%s%s" % (label, cellref(c["r"], c["c"])),
+                                        "钻取「%s」:目标报表的查询参数 %s 未随链接传递,将取默认值(目标的查询面板不随内置带入)"
+                                        % (emb["name"], "、".join(miss[:6]))))
+
+    def build(tp, depth):
+        if tp in registry:
+            return registry[tp]
+        if depth > maxd:
+            return None
+        try:
+            tm = parse_cpt(tp, _server_datasets(cfg))
+        except ET.ParseError:
+            return None
+        sheets = [s for s in tm["sheets"] if s["n_content"] > 0]
+        if not sheets:
+            return None
+        s = sheets[0]
+        emb = {"id": "emb_%d" % (len(registry) + 1), "name": tm["name"], "meta_names": []}
+        registry[tp] = emb                       # 先登记再递归:循环钻取不死循环
+        tq = tm.get("query")
+        # 数据集并入
+        ren = {}
+        for dn in _cells_used_ds(s["cells"].values()):
+            ds = tm["datasets"].get(dn)
+            if ds is None:
+                continue                         # 公共数据集:按名引用
+            cur = model["datasets"].get(dn)
+            if cur is not None and (cur.get("sql"), cur.get("conn")) == (ds.get("sql"), ds.get("conn")):
+                continue
+            nn = dn
+            if cur is not None:
+                nn, i = "%s__%s" % (dn, tm["name"]), 1
+                while nn in model["datasets"]:
+                    i += 1
+                    nn = "%s__%s_%d" % (dn, tm["name"], i)
+                ren[dn] = nn
+            model["datasets"][nn] = dict(ds, name=nn, _server=False)
+        if ren:
+            _rename_ds_in_cells(s["cells"], ren)
+        label = "[钻取:%s] " % tm["name"]
+        visit(s["cells"], depth, label)
+        t_issues = list(s["issues"])
+        q_t = dict(tq, ds_used=set()) if tq else None
+        proc = _process_grid({"name": tm["name"], "cells": s["cells"], "row_h": s["row_h"],
+                              "col_w": s["col_w"], "query": q_t}, cfg, t_issues)
+        for it in t_issues:
+            if it.level == "info" and it.where in ("-", "自适应取证"):
+                continue
+            issues.append(Issue(it.level, label + it.where, it.msg))
+        emb["proc"] = proc
+        model["embed_used"] |= proc["used_ds"]
+        if tq:
+            for k, v in tq.get("meta", {}).items():
+                model["query_extra"]["meta"].setdefault(k, dict(v, required=False))
+                emb["meta_names"].append(k)
+            model["query_extra"]["components"].extend(tq.get("components", []))
+        if len(sheets) > 1:
+            issues.append(Issue("info", label.strip(), "目标报表含 %d 个 sheet,仅内置第一个(%s)"
+                                % (len(sheets), s["sheet"])))
+        model["embeds"].append(emb)
+        return emb
+
+    for s in model["sheets"]:
+        if s["n_content"] > 0:
+            visit(s["cells"], 0, "")
+    return issues
+
+# 帆软「服务器数据集」(.cpt 里只有 NameTableData 名字引用、定义在服务器)→ 默认假定目标系统 SightReport
+# 已有同名「公共数据集」,直接按名字引用,不再标待人工;引用清单汇总到 _public_datasets.txt 供核对。
+_PUBLIC = {"on": True, "report": "", "refs": {}}
+_CONNS = {}      # 未显式映射、按同名使用的帆软连接 → 用到它的报表集合
+
+
+def _note_public_ref(name, report_where, value_field="", label_field=""):
+    e = _PUBLIC["refs"].setdefault(name, {"reports": set(), "fields": set()})
+    e["reports"].add(_PUBLIC["report"])
+    if value_field or label_field:
+        e["fields"].add((value_field, label_field))
+
+
+def _server_datasets(cfg):
+    """按配置 server_datasets(帆软服务器数据集 xml 路径)加载并缓存。"""
+    p = (cfg or {}).get("server_datasets")
+    if not p:
+        return None
+    if p not in _SERVER_DS_CACHE:
+        _SERVER_DS_CACHE[p] = load_server_datasets(p)
+    return _SERVER_DS_CACHE[p]
+
+
 def convert_one(path, outdir, cfg, subdir="", overwrite="overwrite"):
     """overwrite: overwrite=覆盖 / skip=已存在则跳过 / rename=自动改名不覆盖。
     多 sheet 且 cfg['merge_sheets'](默认 True):合并为一个多页签 .mrg;否则每 sheet 拆一张。
     单 sheet 无论如何都走扁平老格式(对既有单 sheet 报表字节级零变化)。"""
+    _PUBLIC["on"] = cfg.get("assume_public_datasets", True)
+    _PUBLIC["report"] = os.path.join(subdir, os.path.splitext(os.path.basename(path))[0]) if subdir \
+        else os.path.splitext(os.path.basename(path))[0]
     try:
-        model = parse_cpt(path)
+        model = parse_cpt(path, _server_datasets(cfg))
     except ET.ParseError as e:
         return [{"name": os.path.basename(path), "ok": False,
                  "error": "XML 解析失败:%s" % e}]
@@ -2688,6 +3491,7 @@ def convert_one(path, outdir, cfg, subdir="", overwrite="overwrite"):
     dest = os.path.join(outdir, subdir) if subdir else outdir
     os.makedirs(dest, exist_ok=True)
     query = model.get("query")
+    embed_issues = _attach_embeds(model, cfg)
 
     # ---- 多 sheet 合并为单个多页签(tab)报表 ----
     if multi and merge:
@@ -2698,6 +3502,7 @@ def convert_one(path, outdir, cfg, subdir="", overwrite="overwrite"):
         combined, processed, union_used, report_cells = [], [], set(), {}
         if query:
             combined.extend(query["issues"])
+        combined.extend(embed_issues)
         for si, s in enumerate(sheets, 1):
             s_issues = list(s["issues"])
             s_sm = {"name": model["name"], "cells": s["cells"],
@@ -2712,11 +3517,15 @@ def convert_one(path, outdir, cfg, subdir="", overwrite="overwrite"):
             # sheet 级网格问题前缀 sheet 名,报告里能定位是哪个页签
             for it in s_issues:
                 combined.append(Issue(it.level, "[%s] %s" % (s["sheet"], it.where), it.msg))
-        params = compute_params(model["datasets"], union_used)
+        params = compute_params(model["datasets"], union_used | model["embed_used"])
         for pn in (query or {}).get("meta", {}):     # 面板控件参数也登记
             params.setdefault(pn, None)
+        for pn in model["embed_params"]:             # 内置钻取的链接参数必须声明,否则被静默丢弃
+            params.setdefault(pn, None)
         head_sm = {"name": model["name"], "report_name": model["name"],
-                   "datasets": model["datasets"], "params": params, "query": query}
+                   "datasets": model["datasets"], "params": params, "query": query,
+                   "embeds": model["embeds"], "embed_used": model["embed_used"],
+                   "query_extra": model["query_extra"]}
         xml_text = map_to_xml_multi(head_sm, processed, cfg, combined)
         title = "%s(多页签 · %d 个 sheet)" % (model["name"], len(sheets))
         report, n_manual, n_deg, n_cells = write_report(
@@ -2750,15 +3559,20 @@ def convert_one(path, outdir, cfg, subdir="", overwrite="overwrite"):
         issues = list(s["issues"])
         if query:
             issues.extend(query["issues"])
-        used_ds = {c["dsName"] for c in s["cells"].values() if c.get("dsName")}
-        params = compute_params(model["datasets"], used_ds)
+        issues.extend(embed_issues)
+        used_ds = _cells_used_ds(s["cells"].values())
+        params = compute_params(model["datasets"], used_ds | model["embed_used"])
         for pn in (query or {}).get("meta", {}):   # 面板控件参数也登记
+            params.setdefault(pn, None)
+        for pn in model["embed_params"]:
             params.setdefault(pn, None)
         report_name = (_sh if _redun
                        else ("%s_%s" % (model["name"], _sh) if multi else model["name"]))
         sm = {"name": model["name"], "cells": s["cells"], "row_h": s["row_h"],
               "col_w": s["col_w"], "datasets": model["datasets"],
-              "params": params, "query": query, "report_name": report_name}
+              "params": params, "query": query, "report_name": report_name,
+              "embeds": model["embeds"], "embed_used": model["embed_used"],
+              "query_extra": model["query_extra"]}
         xml_text = map_to_xml(sm, cfg, issues)
         title = (_sh if _redun
                  else ("%s / %s" % (model["name"], _sh) if multi else model["name"]))
@@ -2784,6 +3598,12 @@ _ISSUE_TYPE_RULES = [
     ("查询控件不支持",   lambda m: "查询控件" in m and "暂不支持" in m),
     ("字典类型不支持",   lambda m: "字典类型" in m and "暂不支持" in m),
     ("条件高亮未转换",   lambda m: "条件高亮" in m),
+    ("服务器数据集未解析", lambda m: "服务器数据集" in m),
+    ("钻取链接待指定目标", lambda m: "钻取链接目标" in m or "钻取目标" in m),
+    ("内嵌图表",         lambda m: "内嵌图表" in m or "图表引用" in m),
+    ("数据列过滤条件",   lambda m: "数据列过滤条件" in m),
+    ("单元格呈现/链接",  lambda m: "单元格呈现" in m or "单元格链接类型" in m or "单元格字典" in m),
+    ("决策报表(.frm)",   lambda m: "决策报表" in m),
     ("富文本/斜线头",    lambda m: ("富文本" in m) or ("斜线头" in m)),
     ("字段需复核",       lambda m: "字段列表为空" in m or "推断字段" in m),
 ]
@@ -2865,6 +3685,56 @@ def write_issues_report(outdir, results):
     }
 
 
+def write_connections(outdir):
+    """未显式映射的数据连接汇总:上线前确认目标系统有同名连接,没有就在映射表里改一次。"""
+    if not _CONNS:
+        return None
+    p = os.path.join(outdir, "_connections.txt")
+    L = ["未显式映射的数据连接(转换时按同名使用;目标系统里连接名称不同的,在转换器映射表里改一次即全部生效)", "=" * 60, ""]
+    for name, reps in sorted(_CONNS.items(), key=lambda kv: -len(kv[1])):
+        L.append("◆ %s  —  %d 张报表使用" % (name, len(reps)))
+    with open(p, "w", encoding="utf-8") as f:
+        f.write("\n".join(L) + "\n")
+    return p
+
+
+def write_public_datasets(outdir):
+    """引用了「公共数据集」(帆软服务器数据集,假定 SightReport 已有同名)的清单,供上线前核对。"""
+    refs = _PUBLIC["refs"]
+    if not refs:
+        return None
+    p = os.path.join(outdir, "_public_datasets.txt")
+    L = ["引用的公共数据集清单(帆软服务器数据集;转换时按同名引用,请确认 SightReport 已存在同名公共数据集)",
+         "=" * 60, ""]
+    for name, e in sorted(refs.items(), key=lambda kv: -len(kv[1]["reports"])):
+        L.append("◆ %s  —  %d 张报表引用" % (name, len(e["reports"])))
+        for vf, lf in sorted(e["fields"]):
+            L.append("    需含字段:值=%s  显示=%s" % (vf or "?", lf or "?"))
+        L.append("    报表:" + "、".join(sorted(e["reports"])[:6])
+                 + ("…" if len(e["reports"]) > 6 else ""))
+    with open(p, "w", encoding="utf-8") as f:
+        f.write("\n".join(L) + "\n")
+    return p
+
+
+def unsupported_frm_row(path, sub=""):
+    """.frm(帆软决策报表/大屏)暂不支持转换:给出可操作的信息(含图表/表格控件数),而非静默跳过。"""
+    base = os.path.splitext(os.path.basename(path))[0]
+    n_chart = n_table = 0
+    try:
+        for e in ET.parse(path).getroot().iter():
+            c = e.get("class", "")
+            if c.endswith("form.ui.ChartEditor"):
+                n_chart += 1
+            elif c.endswith("form.ui.ElementCaseEditor"):
+                n_table += 1
+    except ET.ParseError:
+        pass
+    return {"name": os.path.join(sub, base) if sub else base, "ok": False,
+            "error": "决策报表(.frm)暂不支持(含图表控件 %d、报表块 %d),需转仪表盘/大屏,另行处理"
+                     % (n_chart, n_table)}
+
+
 def _tool_version():
     try:
         import version as _ver
@@ -2890,6 +3760,9 @@ def main():
     ap.add_argument("--auto-width", action="store_true",
                     help="给所有列标 widthMode=\"auto\"(按内容定宽,需 sight-report 2.0.25+)。"
                          "整表一刀切,不是按帆软单元格设置驱动")
+    ap.add_argument("--server-datasets", default=None,
+                    help="帆软服务器数据集文件(如 WEB-INF/resources/datasource.xml),用于解析 "
+                         "NameTableData 引用(单元格字典/下拉字典/图表)")
     ap.add_argument("--auto-width-max", type=float, default=None,
                     help="配合 --auto-width:每列宽度上限(pt);不给则由引擎按设计宽度推导")
     args = ap.parse_args()
@@ -2902,22 +3775,38 @@ def main():
         cfg["auto_width"] = True
     if args.auto_width_max:
         cfg["auto_width_max"] = args.auto_width_max
+    if args.server_datasets:
+        cfg["server_datasets"] = args.server_datasets
     os.makedirs(args.out, exist_ok=True)
 
+    cfg["_input_root"] = (os.path.abspath(args.input) if os.path.isdir(args.input)
+                          else os.path.dirname(os.path.abspath(args.input)))
     pairs = []  # (cpt路径, 相对子目录)
+    frm_files = []  # 决策报表 .frm:暂不支持,但必须在结果里显式列出,不能静默跳过
     if os.path.isdir(args.input):
         root = os.path.abspath(args.input)
         for dp, _, fns in os.walk(args.input):
             for fn in fns:
+                rel = os.path.relpath(dp, root)
+                sub = "" if rel == "." else rel
                 if fn.lower().endswith(".cpt"):
-                    rel = os.path.relpath(dp, root)
-                    pairs.append((os.path.join(dp, fn), "" if rel == "." else rel))
+                    pairs.append((os.path.join(dp, fn), sub))
+                elif fn.lower().endswith(".frm"):
+                    frm_files.append((os.path.join(dp, fn), sub))
+    elif args.input.lower().endswith(".frm"):
+        frm_files.append((args.input, ""))
     else:
         pairs.append((args.input, ""))
 
     results = []
     for fp, sub in sorted(pairs):
         results.extend(convert_one(fp, args.out, cfg, sub))
+    for fp, sub in sorted(frm_files):
+        if cfg.get("frm_mode", "dashboard") == "dashboard":
+            import convert_frm
+            results.extend(convert_frm.convert_frm(fp, args.out, cfg, sub))
+        else:
+            results.append(unsupported_frm_row(fp, sub))
 
     if args.zip:
         import zipfile
@@ -2950,6 +3839,12 @@ def main():
                             % (r["name"], r["cells"], r["manual"], r["degraded"]))
                 else:
                     f.write("| %s | - | - | - | ✗ %s |\n" % (r["name"], r["error"]))
+    _pc = write_connections(args.out)
+    if _pc:
+        print("数据连接清单:%s(共 %d 个)" % (_pc, len(_CONNS)))
+    _pp = write_public_datasets(args.out)
+    if _pp:
+        print("引用公共数据集清单:%s(共 %d 个)" % (_pp, len(_PUBLIC["refs"])))
     # 聚合问题清单(待处理可在此 txt/csv 查看)
     summ = write_issues_report(args.out, results)
     if summ:

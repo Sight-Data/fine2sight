@@ -70,7 +70,7 @@
 <body>
 <div class="wrap">
   <h1>帆软报表 → sight-report 转换器</h1>
-  <p class="hint">把帆软 <code>.cpt</code> 网格报表批量转换为 sight-report 可导入的 <code>.mrg</code>。
+  <p class="hint">把帆软 <code>.cpt</code> 网格报表转为 <code>.mrg</code>,<code>.frm</code> 决策报表转为仪表盘 <code>.mrs</code>(语义化转换,旁附说明),均可导入 sight-report。
      选择文件或文件夹(文件夹会递归),映射数据源,设置输出后开始。</p>
 
   <!-- 升级提示(检测到新版本时显示) -->
@@ -84,7 +84,7 @@
 
   <!-- 1 输入 -->
   <div class="card">
-    <h2><span class="n">1</span>输入(帆软 .cpt 文件或文件夹)</h2>
+    <h2><span class="n">1</span>输入(帆软 .cpt / .frm 文件或文件夹)</h2>
     <div class="row">
       <button id="addFiles">+ 添加文件</button>
       <button id="addFolder">+ 添加文件夹</button>
@@ -214,7 +214,7 @@ function statusCell(r){
 
 function renderResult(res){
   const r = el("result");
-  if(!res || !res.results || !res.results.length){ r.innerHTML = `<div class="empty">没有可转换的 .cpt。</div>`; return; }
+  if(!res || !res.results || !res.results.length){ r.innerHTML = `<div class="empty">没有可转换的 .cpt / .frm。</div>`; return; }
   const parts = [];
   parts.push(`<div class="sum">完成:<b class="b-ok">${res.ok}</b> 成功`
     + (res.skipped?` · <b class="b-skip">${res.skipped}</b> 跳过`:"")

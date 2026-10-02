@@ -60,7 +60,11 @@ def main():
           'concat(A1, formatDate(monthStart(now()), "yyyy-MM-dd"))',
           "多实参,单元格引用不受影响")
 
-    print("全部通过 ✅ (%d 条)" % 10)
+    # FORMAT 按格式串分流(字符串字面量被保护成占位符,曾导致日期格式也走 formatNumber)
+    check('FORMAT(today(),"yyyy-MM-dd")', 'formatDate(date(), "yyyy-MM-dd")', "FORMAT 日期格式")
+    check('FORMAT(x,"#,##0.00")', 'formatNumber(x, "#,##0.00")', "FORMAT 数字格式")
+
+    print("全部通过 ✅ (%d 条)" % 12)
 
 
 if __name__ == "__main__":

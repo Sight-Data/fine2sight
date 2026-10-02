@@ -4,9 +4,14 @@
 > 每个映射都经过「参数顺序 / 基准 / 语义 / 上下文」核对,而非仅对函数名。
 > 扩充映射时改这里 + 同步 `convert.py` 的 `FR_SAFE` / `FR_RENAME` / 专项重写。
 
-**实测覆盖率(全库 3364 张 .cpt,72,055 条公式):确定性翻译干净 99.2%,标红需人工 0.8%。**
+**覆盖率(早期一次全库统计,3364 张 .cpt、72,055 条公式):确定性翻译干净 99.2%,标红 0.8%。**
+该数字是 2026-07 的快照,之后新增了 §2.5b 的映射(干净率只会更高),但**没有重跑**;本库当前只有 240 张 .cpt 可测。
 
-magic 端函数语义以 `docs/ai-docs/expression-syntax-guide.md`(MagicScript 引擎)为准。
+> 📌 **核对状态(2026-10-02)**:本文已对照 `convert.py` 当前行为与 `sight-data-code` 的
+> `ai-docs/expression-syntax-guide.md`(最后改动 2026-08-23,仅「子报表不可嵌套」,与函数语义无关)逐条核过;
+> 一并修了 `FORMAT(x,"yyyy-MM-dd")` 误走 `formatNumber` 的 bug(§2.6,已加回归用例)。
+
+magic 端函数语义以 `ai-docs/expression-syntax-guide.md`(MagicScript 引擎)为准。
 
 ---
 
@@ -64,7 +69,9 @@ magic 端函数语义以 `docs/ai-docs/expression-syntax-guide.md`(MagicScript �
 | `MONTHDELTA(d,n)` | 248 | d 加 n 月 | `addMonths(d,n)` | 改名 | ✅ |
 | `DATEINMONTH(d,1)` | ~4242 | 当月第 1 天 | `monthStart(d)` | 重写 | ✅ |
 | `DATEINMONTH(d,-1)` | (同上) | 当月最后一天 | `monthEnd(d)` | 重写 | ⚠️ magic `monthEnd` 含 23:59:59.999,帆软为当天 00:00:00;作 BETWEEN 上界时 magic 更合理 |
-| `DATEINMONTH(d,n)` n≠±1 | 492 | 当月第 n 天 | — | **标红** | magic 无直接对应 |
+| `DATEINMONTH(d,n)` n≠±1 | 492 | 当月第 n 天 | `addDays(monthStart(d), n-1)` | 近似重写 | ⚠️ 2026-10 起不再标红;首参为复合表达式时见 §3.1b 已知缺口 |
+| `DATEINQUARTER(d,1/-1)` | 4–6 | 当季第一天/最后一天 | `quarterStart/quarterEnd(d)` | 重写 | ✅ |
+| `year()/month()/day()` 无参 | — | 当前年/月/日 | `year(now())` 等 | 重写 | ✅ magic 同名函数必须带日期参数 |
 | `YEAR/MONTH/DAY(d)` | 38+ | 年/月/日分量 | `year/month/day(d)` | 直接 | ✅ MONTH 均 1–12 |
 | `日期 ± 整数` | — | 加减天数 | `addDays(d,±n)` | 重写 | ✅ 帆软 `today()-1` → `addDays(now(),-1)` |
 
@@ -78,12 +85,26 @@ magic 端函数语义以 `docs/ai-docs/expression-syntax-guide.md`(MagicScript �
 | `$参数` | 16805 条含 | 报表参数 | `$参数` | 直通 | ✅ 两端均单 `$` 前缀 |
 | 单元格名 `B4` / 区域 `A1:A10` | 36708 条含 | 单元格引用 | 同写法 | 直通 | ✅ 帆软格名与 magic 格名一致(见转换器坐标说明) |
 
+### 2.5b 2026-08 以后新增映射(原「未映射」清单已收窄,见 §4)
+
+| 帆软 | magic 对应 | 决策 | 说明 |
+|---|---|---|---|
+| `FIND(子串,母串)` | `(find(母串,子串) + 1)` | 重写 | 参数顺序交换 + 基准 0→1;`find(...)>0` 判断因此保持正确(详见 §3.2) |
+| `TRUNC(x[,n])` | `trunc(...)` | 改名 | 向零截断(后端 sight-platform 新增同义函数) |
+| `DATETONUMBER(d)` | `dateToNumber(d)` | 改名 | 日期转毫秒 |
+| `SWITCH(e,k1,v1,…[,def])` | `((e)==k1 ? v1 : (… : def))` | 重写 | magic 无 switch,展开成嵌套三元 |
+| `SPLIT(s,sep)` | `(s == null ? "" : s).split(sep)` | 重写 | |
+| `INDEXOFARRAY(a,n)` | `arrayGet(a, n-1)` | 重写 | 1 基→0 基 |
+| `CNMONEY(x)` | `numberToRMB(x)` | 改名 | |
+| `SUBSTITUTE` | `replace` | 改名 | 同 §3.5 的正则注意事项 |
+| `{J4}` / `{J4:K5}` | `J4` / `J4:K5` | 重写 | 帆软花括号单元格引用,magic 不认花括号(真机会整张报表解析失败) |
+
 ### 2.6 格式化(按格式串判定)
 
 | 帆软 | 频次 | 帆软语义 | magic 对应 | 决策 | 参数核对 |
 |---|---|---|---|---|---|
 | `FORMAT(x,"0.00%")` | 126 | 数字/日期格式化 | `formatNumber(x,...)` | 重写 | ✅ 含 `# 0 % ,` → formatNumber |
-| `FORMAT(x,"yyyy-MM-dd")` | (同上) | 日期格式化 | `formatDate(x,...)` | 重写 | ✅ 含 `y M d H s` 且无 `# %` → formatDate |
+| `FORMAT(x,"yyyy-MM-dd")` | (同上) | 日期格式化 | `formatDate(x,...)` | 重写 | ✅ 含 `y M d H s` 且无 `# %` → formatDate。⚠️ 2026-10-02 前此分支实际失效(字符串字面量已被占位符保护,格式串没还原就做判断,日期格式也走成 formatNumber),现已修复 |
 
 ---
 
@@ -129,14 +150,15 @@ magic 端函数语义以 `docs/ai-docs/expression-syntax-guide.md`(MagicScript �
 > `date()`"兜底规则误转成字符串(日期对象上下文本该是 `now()`)。此为独立于本节的既有缺口,
 > 出现概率低(需要复合首参 + 非 ±1 的 n),未在本轮修复范围内。
 
-### 3.2 FIND:参数顺序 + 基准都不同 → 不映射
+### 3.2 FIND:参数顺序 + 基准都不同 → 重写(不是直接改名)
 
 ```
 帆软  find(子串, 母串)   1-based,未找到返回 0,惯用 find(...)>0 判断
 magic find(母串, 子串)   0-based,未找到返回 -1
 ```
 
-两处不一致(顺序反、基准差),`find(...)>0` 会把"首位匹配"误判为未找到。**故意标红**,不做静默映射。
+两处不一致(顺序反、基准差)。早期版本故意标红;现在改为**同时交换参数并 +1**:
+`find("a",B1)` → `(find(B1, "a") + 1)`,未找到 -1+1=0、首位匹配 0+1=1,`>0` 判断语义保持。
 
 ### 3.3 COUNT / 聚合的单元格扩展
 
@@ -162,38 +184,40 @@ magic `count(v1,v2,...)` 文档定义为「参数个数(含 null)」。对 `coun
 
 ## 3.6 SQL 参数语法(两边规则不同,必译)
 
-帆软 `${}` 是**文本内联**(值直接拼进 SQL,故参数都写在引号内);magic 的内联是 `#{}`,
-而 magic `${}` 是预编译 `?` 绑定(放进引号会变 `'?'` 坏掉)。故统一译为 `#{}` 以 1:1 复刻帆软行为。
+帆软 `${}` 是**文本内联**(值直接拼进 SQL,故参数都写在引号内);magic(报表与仪表盘数据集同一套)有三种写法:
+`$p` / `${$p}` 是**预编译 `?` 绑定**(放进引号会变 `'?'`),`#{表达式}` 是**表达式字面量拼接**(过注入校验)。
+早期版本统一译成 `#{$p}` 内联;现已改成**按上下文选写法**(`translate_sql`):
 
 | 帆软 | magic | 说明 |
 |---|---|---|
-| `'${kaishirq}'` | `'#{$kaishirq}'` | 参数加 `$`,引号不动,内联 |
-| `${num}` | `#{$num}` | 同上 |
-| `'%${kw}%'` | `'%#{$kw}%'` | LIKE 内联 |
-| `${if(len(k)==0,"","and c in('"+k+"')")}` | `#{if(length($k)==0,"","and c in('"+$k+"')")}` | 动态片段:换 `#{}` + 函数翻译(`len→length`)+ 片段内**参数加 `$`**,字符串内 SQL 列名不动 |
+| `x = '${kw}'`(引号内裸参数) | `x = #{isEmpty($kw) \|\| $kw == '' ? "null" : "'" + $kw + "'"}` | 引号交给表达式生成;**空值变 `null`**,不再是 `''` |
+| `like '%${kw}%'` | `like ${'%' + $kw + '%'}` | 拼好值后走预编译绑定 |
+| `x = ${num}` | `x = $num` | 裸参数 → 预编译绑定 |
+| `in (${ids})` | `in (#{isEmpty($ids) \|\| $ids == '' ? "null" : $ids})` | 帆软此处的值本身是「SQL 列表文本」(如 `1,2`),不能再包引号 |
+| `${if(len(k)==0,"","and c in('"+k+"')")}` | `#{if((isEmpty($k) \|\| $k == ''),"","and c in ('" + $k + "')")}` | 动态片段:换 `#{}` + 函数翻译(`len→length`)+ 参数加 `$`,字符串内 SQL 列名不动 |
 
-规则:`${}` 内**裸标识符**(非函数调用、字符串外、非 `true/false/null`)= 参数 → 加 `$`;
-函数名(后接 `(`)按 §2 翻译;参数同时登记进 `<parameter>`(含只在 `if()` 里出现的)。
+分流依据(转换时按参数/控件类型判定):日期型参数(`datatype` 为 Date/DateTime,或绑日期控件)不可内联成字符串;
+多选参数(`ComboCheckBox`/`CheckBoxGroup`,声明 `List`)走 `.join`;布尔参数(单个 `CheckBox`→`switch`)既不内联也不 `join`。
+参数同时登记进 `<parameter>`(含只在 `if()` 里出现的)。
 
-> 实测:全库 12,541 处 `${if}` 动态条件、35,508 处参数内联正确改写。
-> **注入风险**:`#{}` 直接拼接,与帆软原状一致(非本工具引入);受控参数如需预编译安全可手工改 `${}`。
+> **注入风险**:`#{}` 直接拼接,与帆软原状一致(非本工具引入);只走预编译 `$p` 的写法不受影响。
+> 仪表盘的数据集 SQL 用同一套语法(`${$p}` 等价于 `$p`),每个被引用的参数都要有同名 `<parameter>`。
 
 ## 4. 未映射清单(标红 → P2 / AI 兜底)
 
-按频次:
+2026-10-02 现状(`translate_expression` 实测;括号内为早期全库频次):
 
 | 帆软函数 | 频次 | 原因 |
 |---|---|---|
-| `DATEINMONTH(x,n)` n≠±1 | 492 | 取某月第 n 天,magic 无直接对应 |
-| `DATETONUMBER` | 32 | 日期转数值,无 1:1 |
-| `TRUNC` | 16 | 截断(≠ floor,负数不同) |
 | `VALUE(ds,field)` | 14 | 数据字典取值,需改 `dataset()` 语义 |
-| `SWITCH(v,c1,r1,…)` | 8 | 多分支,可由 AI 改 `if` 嵌套 |
-| `INDEXOFARRAY / UNIQUEARRAY / ARRAY` | 8/6/8 | 数组类,无 1:1 |
-| `CNMONEY` | 8 | 金额中文(近 magic `numberToRMB`,待核对) |
-| `SELECT / SPLIT / DATEINQUARTER / FIND` | 4–6 | 数据/字符串/日期专有 |
+| `SELECT(...)` | 4–6 | 数据集取值专有 |
+| `UNIQUEARRAY / ARRAY` | 6/8 | 数组类,无 1:1 |
+| `ROUNDUP(x,d)` 带位数 | — | 仅单参 `ROUNDUP(x)`→`ceil` |
+| `DATEINMONTH(复合表达式,n)` | 少 | 内层 `TODAY()` 可能被误转 `date()`,见 §3.1b |
 
-> 这些占总公式 0.8%。P2 可建「AI 兜底」:把标红表达式连同本表上下文交 LLM 产出 magic 等价式,再人工确认。
+已从本清单移出(见 §2.5b):`DATEINMONTH n≠±1`(近似)、`DATETONUMBER`、`TRUNC`、`SWITCH`、`INDEXOFARRAY`、`CNMONEY`、`SPLIT`、`FIND`、`DATEINQUARTER`。
+
+> 剩余项占总公式远低于 0.8%。P2 可建「AI 兜底」:把标红表达式连同本表上下文交 LLM 产出 magic 等价式,再人工确认。
 
 ---
 
@@ -205,6 +229,7 @@ magic `count(v1,v2,...)` 文档定义为「参数个数(含 null)」。对 `coun
 4. **确认不兼容** → 不加(自动落入标红),在本文档 §4 登记原因。
 5. 改完跑全库覆盖率自测:
    ```bash
-   # 见 README「质量保障」:统计 clean/flagged 比例 + XSD 校验
+   python3 test_expression.py     # 表达式回归(12 条)
+   # 全库覆盖率统计见 README「质量保障」
    ```
 6. **务必同步更新本表**,保持「代码映射 ↔ 文档依据」一致。

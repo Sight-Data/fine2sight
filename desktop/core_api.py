@@ -2,7 +2,7 @@
 """桌面应用核心层(与 GUI 框架无关,可无头单测)。
 
 封装现有 convert.py 内核,对外提供三件事:
-  - list_cpt(inputs)          枚举输入(文件/目录,目录递归)中的 .cpt,带镜像子目录
+  - list_cpt(inputs)          枚举输入(文件/目录,目录递归)中的 .cpt/.frm,带镜像子目录
   - scan_connections(inputs)  扫描所有 .cpt 的帆软连接名(<DatabaseName>)去重
   - run_conversion(...)        按选项批量转换,返回每文件结果
 
@@ -38,11 +38,11 @@ def list_cpt(inputs):
             base = os.path.basename(inp.rstrip(os.sep)) or "report"
             for dp, _, fns in os.walk(inp):
                 for fn in fns:
-                    if fn.lower().endswith(".cpt"):
+                    if fn.lower().endswith((".cpt", ".frm")):
                         rel = os.path.relpath(dp, inp)
                         sub = base if rel == "." else os.path.join(base, rel)
                         pairs.append((os.path.join(dp, fn), sub))
-        elif inp.lower().endswith(".cpt") and os.path.isfile(inp):
+        elif inp.lower().endswith((".cpt", ".frm")) and os.path.isfile(inp):
             pairs.append((inp, ""))
     return sorted(set(pairs))
 
@@ -111,7 +111,11 @@ def run_conversion(inputs, outdir, conn_map=None, overwrite="overwrite",
     total = len(pairs)
     for i, (fp, sub) in enumerate(pairs, 1):
         try:
-            rows = convert.convert_one(fp, outdir, cfg, sub, overwrite=overwrite)
+            if fp.lower().endswith(".frm"):            # 决策报表 → 仪表盘 .mrs
+                import convert_frm
+                rows = convert_frm.convert_frm(fp, outdir, cfg, sub, overwrite=overwrite)
+            else:
+                rows = convert.convert_one(fp, outdir, cfg, sub, overwrite=overwrite)
         except Exception as e:                       # 单文件异常不打断整批
             rows = [{"name": os.path.basename(fp), "ok": False,
                      "error": "转换异常:%s" % e}]
@@ -131,7 +135,7 @@ def run_conversion(inputs, outdir, conn_map=None, overwrite="overwrite",
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
             for dp, _, fns in os.walk(outdir):
                 for fn in fns:
-                    if fn.endswith(".mrg"):
+                    if fn.endswith((".mrg", ".mrs")):
                         full = os.path.join(dp, fn)
                         z.write(full, os.path.relpath(full, outdir))
 

@@ -44,7 +44,7 @@ class Api:
         w = webview.windows[0]
         res = w.create_file_dialog(
             webview.OPEN_DIALOG, allow_multiple=True,
-            file_types=("帆软报表 (*.cpt)", "所有文件 (*.*)"))
+            file_types=("帆软报表 (*.cpt;*.frm)", "所有文件 (*.*)"))
         return list(res) if res else []
 
     def pick_folder(self):

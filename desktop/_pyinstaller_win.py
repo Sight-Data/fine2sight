@@ -32,6 +32,7 @@ def main():
         "--add-data", "web;web",
         "--paths", "..",
         "--hidden-import", "convert",
+        "--hidden-import", "convert_frm",
         "--hidden-import", "version",
         "--hidden-import", "_build",
         "app.py",

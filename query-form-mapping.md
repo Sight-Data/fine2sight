@@ -8,7 +8,12 @@
 ---
 
 > **状态:§2 / §4「应实现」部分已编码完成**(convert.py 的 `_parse_query_panel`):
-> 全库 3290 面板 / 30,950 组件转换、XSD 通过、随机样本 JSON 全合法。§3 的 gap 按方案标红交人工。
+> 全库 3290 面板 / 30,950 组件转换、XSD 通过、随机样本 JSON 全合法(2026-08 的一次全库统计)。§3 的 gap 按方案标红交人工。
+>
+> 📌 **核对状态(2026-10-02)**:已对照 `convert.py` 当前行为和 sight-data-code 的
+> `report-query-types.ts`(最后改动 2026-09-24)核过,见文末「§5 2026-08 之后的变化」。
+> 同一套查询面板转换现在也服务 **`.frm` 决策报表 → 仪表盘**(`convert_frm.py` 复用 `_parse_query_panel`,
+> 把组件位置改成仪表盘过滤栏的流式占位)。
 
 ## 0. 结论
 
@@ -55,22 +60,26 @@
 | 帆软 | magic `type` | 备注 |
 |---|---|---|
 | `Label` | `text` | `content`=标签文字 |
-| `DateEditor` | `date` | 由 `DateAttr format` 推 `datePickerType`:含 `HH`→`datetime`,`yyyy-MM`→`month`,否则 `date`;`format`/`valueFormat` 原样带 |
+| `DateEditor` / `Year` | `date` | 由 `DateAttr format` 推 `datePickerType`:含 `HH`→`datetime`,`yyyy-MM`→`month`,否则 `date`;`format`/`valueFormat` 原样带 |
 | `TextEditor` | `input` | |
+| `TextArea` | `input` | 多行文本降级为单行输入(2026-10 起,此前标「不支持」) |
 | `NumberEditor` | `number` | |
 | `ComboBox` | `select` | |
 | `ComboCheckBox` | `multiselect` | |
 | `RadioGroup` | `radio` | |
 | `CheckBoxGroup` | `checkbox` | 复选框**组**，选项来自 `<Dictionary>`，值是数组 |
 | `CheckBox` | `switch` | 单个布尔勾选。**不可与 `CheckBoxGroup` 合并映射**，见 §3 #2 |
-| `FormSubmitButton` | `query` | 查询按钮 |
+| `FormSubmitButton` | `query` | 查询按钮(仪表盘过滤栏没有这个按钮概念,`.frm` 转换时丢弃,过滤栏用即时查询) |
+| `TreeComboBoxEditor` | `tree-select` | 分层数据集树:单表自引用→UNION 扁平节点数据集;否则懒加载 `treeLevels`;层级信息不全→标红 |
 
 ### 2.2 下拉选项来源
 
 | 帆软 | magic | 映射 |
 |---|---|---|
-| `CustomDictionary`(`<Dict key value>`) | `props.options`(`optionsBindingType="custom"`) | key→value、value→label |
-| `TableDataDictionary` | `props.datasetBinding{datasetName,labelField,valueField}`(`optionsBindingType="dataset"`) | 取字典绑定的数据集与显示/实际列 |
+| `CustomDictionary`(`<Dict key value>`) | `props.customBinding`(`optionsBindingType="custom"`) | key→value、value→label。⚠️ 运行时读的是 `customBinding`(早期文档写成 `props.options`,不准) |
+| `TableDataDictionary` | `props.datasetBinding{datasetName,labelField,valueField}`(`optionsBindingType="dataset"`) | 取字典绑定的数据集与显示/实际列;**字典数据集本身被别的参数过滤时改走 `remote`**(否则选中后下拉只剩一项) |
+| `DatabaseDictionary`(直连表字典) | 自动合成 `SELECT DISTINCT 显示[,值] FROM 表` 数据集 + `datasetBinding` | 不再标红 |
+| 服务器数据集字典 | 按同名公共数据集引用(`assume_public_datasets`) | 清单见 `_public_datasets.txt` |
 
 ### 2.3 通用字段
 
@@ -121,7 +130,7 @@
 |---|---|---|---|---|
 | 1 | **自定义 JS 监听**(`afteredit` 等,做级联下拉/自定义校验) | 831 | 查询组件无 JS 钩子 | **兼容**:省→市这类**级联下拉**可尝试映射 magic `tree-select` 或「数据集随上级参数过滤」近似;任意业务 JS → **标红交人工**。**扩充**(加 JS 钩子)成本高、属产品决策,暂不建议 |
 | 2 | ~~**单个 `CheckBox`**(布尔勾选)~~ | 172 | **已解决**(2026-08-13):magic 新增 `switch` 组件 | 见下方「#2 已解决」 |
-| 3 | **`FreeButton` 自定义按钮** | 389 | 仅 `query`/`reset` | **兼容**:文案/动作是标准查询、重置 → `query`/`reset`;带自定义 JS 动作 → 标红 |
+| 3 | **`FreeButton` 自定义按钮** | 389 | `query`/`reset` | 现状:一律**标红交人工**(未按文案推断成 `query`/`reset`) |
 | 4 | **`EditorHolder` 容器控件** | 18 | 无对应 | **标红**(极少,人工处理) |
 | 5 | **控件级装饰样式**(每控件字体/边框/背景) | 多 | `component.style` 仅 `labelWidth/width/showLabel/labelPosition` | **兼容**:丢弃装饰样式,保留标签/位置/尺寸。查询面板美观损失很小 |
 | 6 | **面板标题 / 窗口位置 / 对齐**(`PWTitle`/`windowPosition`/`align`) | 全量 | `queryFormSetting` 无面板级元数据 | **兼容**:丢弃(magic 面板自带样式)。如需保留面板标题 → 可**扩充** `ReportQuerySetting` 加 `title` 字段(小改) |
@@ -169,3 +178,23 @@
 
 > 自定义 JS 联动若量大且重要,后续可配 AI:把帆软 JS + 上下文交 LLM,产出 magic 的
 > 「数据集按参数过滤」或 tree-select 配置,再人工确认。
+
+---
+
+## 5. 2026-08 之后的变化(与 sight-report 现状对照)
+
+**转换器已落地(原文档未提或写法不准)**
+- 成对「开始/结束」日期 → `queryFormSetting.validations` 的 `dateOrder` 跨字段校验(按参数名/标签关键词判定角色,数量不等不强加)。
+- 极窄(<35px)文本/数值框视为 JS 驱动的隐藏辅助控件,跳过渲染、保留参数。
+- 日期型参数不再内联成字符串,多选参数声明 `List`,布尔参数声明 `Boolean`(见 `function-mapping.md` §3.6)。
+
+**sight-report 新增、转换器尚未利用**(可作为下一步)
+- `date-range`(2026-09-16,「日期范围」):评估后**有意不合并**成对日期,仍转两个独立 `date` 控件 + `dateOrder`。理由:
+  ① 日期范围只能绑**字符串**参数,而帆软日期参数转过来是 `Date`/`DateTime`,SQL 里按日期类型处理的写法(比较/formatDate)要连带改;
+  ② 它的默认值只有固定 `defaultStart/defaultEnd` 和快捷项,表达不了帆软常见的 `=today()-100`、`=DATEINMONTH(today(),1)` 这类公式默认值,合并会丢默认区间;
+  ③ 日期时间(`yyyy-MM-dd HH:mm:ss`,占全库 5749 个日期控件的绝大多数)不在它的粒度(日/月)内。
+  只有「按月/按天、固定默认、字符串参数」的新建报表才适合直接用;转换器保持两个独立日期框以保证行为 1:1。
+- 选项级联(2026-08-14):绑定数据集的下拉会跟随其他查询条件重新取数——可覆盖一部分「级联下拉」的自定义 JS(§3 #1),
+  目前 JS 联动仍整体标红。
+- `record-selector`(搜索选择)、`reset`(重置按钮):转换器未产出。
+- 仪表盘过滤栏还有 `scope/exclude`(作用于哪些区块)、`field`(按列筛选)、`trigger`(即时/按钮),详见 `docs/dashboard-format-notes.md` §D。

@@ -31,14 +31,14 @@ def main(inputs):
               ("files", "reports", "ok", "failed", "skipped")}, "unmapped=", r1["unmapped"])
         assert r1["ok"] >= 1 and r1["failed"] == 0
         assert set(r1["unmapped"]) == set(conns), "未映射连接应等于扫描到的连接"
-        n_mrg = sum(1 for dp, _, fns in os.walk(tmp) for f in fns if f.endswith(".mrg"))
+        n_mrg = sum(1 for dp, _, fns in os.walk(tmp) for f in fns if f.endswith((".mrg", ".mrs")))
         assert n_mrg == r1["ok"], "落盘 .mrg 数应等于成功数"
         # 未显式映射时,dataSourceName 应默认沿用帆软原始连接名(不再留空)
         if conns:
             hit_default = False
             for dp, _, fns in os.walk(tmp):
                 for f in fns:
-                    if f.endswith(".mrg"):
+                    if f.endswith((".mrg", ".mrs")):
                         txt = open(os.path.join(dp, f), encoding="utf-8").read()
                         if any('dataSourceName="%s"' % c in txt for c in conns):
                             hit_default = True
@@ -55,9 +55,9 @@ def main(inputs):
         r3 = core_api.run_conversion(inputs, tmp, conn_map={}, overwrite="rename")
         print("run#3 rename:", {k: r3[k] for k in ("ok", "skipped", "failed")})
         assert r3["ok"] == r1["ok"], "rename 应重新生成同样多的报表"
-        n_mrg_after = sum(1 for dp, _, fns in os.walk(tmp) for f in fns if f.endswith(".mrg"))
+        n_mrg_after = sum(1 for dp, _, fns in os.walk(tmp) for f in fns if f.endswith((".mrg", ".mrs")))
         assert n_mrg_after == n_mrg * 2, "rename 后 .mrg 应翻倍"
-        assert any(f.endswith("_1.mrg") for dp, _, fns in os.walk(tmp) for f in fns)
+        assert any(f.endswith(("_1.mrg", "_1.mrs")) for dp, _, fns in os.walk(tmp) for f in fns)
 
         # 4) 映射数据源:映射值=数据连接名称(字符串),映射后 unmapped 应为空,.mrg 含 dataSourceName(无 dataSourceId)
         if conns:
@@ -73,7 +73,7 @@ def main(inputs):
                 hit = False
                 for dp, _, fns in os.walk(tmp2):
                     for f in fns:
-                        if f.endswith(".mrg"):
+                        if f.endswith((".mrg", ".mrs")):
                             txt = open(os.path.join(dp, f), encoding="utf-8").read()
                             if 'dataSourceName="数据连接_' in txt:
                                 hit = True
@@ -91,7 +91,7 @@ def _snapshot(root):
     # 只比对报表产物(.mrg/.report.md);_summary.md 每次重写属正常,不计入
     return {os.path.relpath(os.path.join(dp, f), root): os.path.getsize(os.path.join(dp, f))
             for dp, _, fns in os.walk(root) for f in fns
-            if f.endswith(".mrg") or f.endswith(".report.md")}
+            if f.endswith((".mrg", ".mrs")) or f.endswith(".report.md")}
 
 
 if __name__ == "__main__":

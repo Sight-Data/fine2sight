@@ -102,10 +102,13 @@ python3 convert.py 某报表.cpt -o out --split-sheets
 - 数据列绑定、扩展方向(纵/横)
 - 父格绑定:显式父格 → magic 单元格 `left/top`(小计行、交叉表的父子关系自动还原)
 - 分组、汇总(`sum/count/avg/max/min`)
-- 条件高亮(公式条件):背景色/字体色/加粗,含 cell/row/column scope
+- 条件高亮(公式条件):背景色/字体色/加粗,含 cell/row/column scope;「满足条件后显示为某值」(ValueHighlightAction)→ `newValue` 规则(如空值显示 0)
 - SQL 数据集:参数语法翻译(含动态 SQL `${if}`)、连接名→数据源映射
 - 报表参数:名/默认值/类型推断/必填
 - 查询面板:各类控件、下拉选项(含字典数据集)—— 详见 `query-form-mapping.md`
+- 单元格字典(DictPresent:代码→名称)→ 值映射 facade;钻取/网页超链接 → `<links>`;
+  数据列过滤(字段=单元格/常量)→ `filterCondition`;内嵌图表(柱/折线/面积/饼)→ ECharts 图表(样式需核对)
+- 查询面板 `Year` 年份控件 → 年份选择器
 - 样式:字体、颜色、加粗、边框、行高列宽
 - 公式翻译:帆软表达式 → MagicScript,同名同参数直接映射,改名/改写按语义处理,
   参数不一致的函数(如 `FIND` 的 0/1-based 不同)**故意不转,标红交人工**,避免静默出错
@@ -119,7 +122,19 @@ python3 convert.py 某报表.cpt -o out --split-sheets
 - 未在 `connection_map` 显式配置的数据源:默认沿用帆软原始连接名(报告标 ⚠️ 提示核对);
   若 Sight Report 里的连接名称不同,需在 `connection_map` 里配置对应关系
 - 富文本/斜线表头:仅提取纯文本
-- 图表 / 子报表 / 填报:不处理
+- **`.frm` 决策报表 → 仪表盘 `.mrs`**(`convert_frm.py`,语义化转换而非 1:1 搬运,每张旁生成 `.report.md` 列出做了哪些优化/哪些要人工):
+  仪表盘图→KPI 指标卡;柱/线/面积/饼/雷达/区间图→chart 区块(组合图取带数据的系列、钻取地图→省级 map 区块)(单行多指标宽表自动反透视、类别字典并进 SQL);
+  报表块→table 区块(字典翻译/公式列并进 SQL、隐藏列与序号列去掉、合计行改合计数据集让占比列算对);
+  查询面板→过滤栏;控件坐标→行/列版面(KPI 行高 108、表格行自适应)。
+  结构自检 `python3 test_frm_dashboard.py`,单元测试 `python3 test_frm_units.py`。
+  数据取自隐藏报表块单元格的图表/仪表盘(`=report0~H3`、`=sum(B4)`、`=D3/C3`)会翻成 SQL 数据集;不可见的图表/报表块不再显示。
+  限制:内嵌静态数据集(加密)、仪表盘取值于报表块单元格、报表块内嵌图表单元格、数据取自报表块单元格的图表、
+  控件联动 JS 需人工;服务器数据集按同名引用,需在仪表盘里「引用公共数据集」。`frm_mode:"off"` 可恢复旧行为(只列为未转换)。
+- 内嵌图表仅覆盖 柱/折线/面积/饼;仪表盘、地图、雷达、组合图等 → 占位文本 + 待人工
+- 引用「服务器数据集」(`NameTableData` 但定义不在 .cpt 内)的字典/下拉/图表:给 `--server-datasets`
+  (帆软 `WEB-INF/resources/datasource.xml`)才能解析,否则标待人工
+- 钻取链接目标报表的 fileId 要导入后才有:只带 `fileName`+参数;可用配置 `link_file_map` 预置
+- 子报表 / 填报:不处理
 
 ## 版本
 
