@@ -33,3 +33,5 @@ _to_delete/
 # 一次性推送脚本(仅本机用,不入库)
 /push-fine2sight.sh
 /push-fine2sight.command
+fine2sight-1.3.0-src.zip
+docs/samples/门诊费用概览.mrs
