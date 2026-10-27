@@ -3517,7 +3517,8 @@ def convert_one(path, outdir, cfg, subdir="", overwrite="overwrite"):
             # sheet 级网格问题前缀 sheet 名,报告里能定位是哪个页签
             for it in s_issues:
                 combined.append(Issue(it.level, "[%s] %s" % (s["sheet"], it.where), it.msg))
-        params = compute_params(model["datasets"], union_used | model["embed_used"])
+        params = compute_params(model["datasets"], union_used | model["embed_used"]
+                                | (query or {}).get("ds_used", set()))   # 下拉字典数据集的 ${参数}(如 caiDanId)也要声明
         for pn in (query or {}).get("meta", {}):     # 面板控件参数也登记
             params.setdefault(pn, None)
         for pn in model["embed_params"]:             # 内置钻取的链接参数必须声明,否则被静默丢弃
@@ -3561,7 +3562,8 @@ def convert_one(path, outdir, cfg, subdir="", overwrite="overwrite"):
             issues.extend(query["issues"])
         issues.extend(embed_issues)
         used_ds = _cells_used_ds(s["cells"].values())
-        params = compute_params(model["datasets"], used_ds | model["embed_used"])
+        params = compute_params(model["datasets"], used_ds | model["embed_used"]
+                                | (query or {}).get("ds_used", set()))   # 同上:下拉字典数据集的参数
         for pn in (query or {}).get("meta", {}):   # 面板控件参数也登记
             params.setdefault(pn, None)
         for pn in model["embed_params"]:
