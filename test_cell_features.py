@@ -58,7 +58,7 @@ def run():
     assert '<parameter name="k" value="A2" isExpression="true" />' in mrg
     assert "钻取链接目标" in msgs
     # 4) 数据列过滤(单元格引用)
-    assert re.search(r'<condition itemType="common" leftValue="b" operator="equals" '
+    assert re.search(r'<condition joinType="and" itemType="common" leftValue="b" operator="equals" '
                      r'rightValueType="Cell" rightValue="B1"', mrg), re.findall(r"<condition[^>]*>", mrg)
     # 关闭公共数据集假设 → 回到待人工
     with tempfile.TemporaryDirectory() as d:

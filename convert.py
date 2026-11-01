@@ -100,7 +100,10 @@ DEFAULT_CONFIG = {
 
 SUMMARY_FN_MAP = {
     "SumFunction": "sum", "CountFunction": "count", "AverageFunction": "avg",
-    "MaxFunction": "max", "MinFunction": "min", "NoneFunction": "none",
+    "MaxFunction": "max", "MinFunction": "min",
+    # 帆软「不汇总」:取列值本身。⚠️不能写 none——后端 AggregateType 无此枚举,
+    # valueOf 抛错 → 整张报表「Error parsing dataset content definition」打不开。
+    "NoneFunction": "select",
 }
 AGG_NUMERIC = {"sum", "avg", "max", "min", "count", "distinctCount"}
 
@@ -206,6 +209,25 @@ def _expand_switch(tmp):
             res = "((%s) == %s ? %s : %s)" % (expr, rest[k], rest[k + 1], res)
         tmp = tmp[:m.start()] + res + tmp[end:]
     return tmp.replace("switch\x07", "switch")
+
+
+def _expand_multi_if(tmp):
+    """帆软 IF 支持多条件 IF(c1,v1,c2,v2,…,默认);magic if 仅 3 参,多出的参数报
+    「if() 参数个数不对」(真机:宁远 病历质控综合查询 SQL #{} 片段)。改写为嵌套 if;
+    参数个数为偶(无默认)时以 "" 兜底(SQL 片段里=不加子句)。由内向外处理以兼顾嵌套。"""
+    starts = [m.start() for m in re.finditer(r"(?i)(?<![\w$.])if\s*\(", tmp)]
+    for st in reversed(starts):
+        op = tmp.index("(", st)
+        args, end = _balanced_args(tmp, op)
+        if not args or len(args) <= 3:
+            continue
+        a = [x.strip() for x in args]
+        res = a[-1] if len(a) % 2 == 1 else '""'
+        pairs = a[:-1] if len(a) % 2 == 1 else a
+        for k in range(len(pairs) - 2, -1, -2):
+            res = "if(%s, %s, %s)" % (pairs[k], pairs[k + 1], res)
+        tmp = tmp[:st] + res + tmp[end:]
+    return tmp
 
 
 def _swap_find_args(tmp):
@@ -324,6 +346,18 @@ _DATE_RESULT_CALL_INLINE = (
     r"addDays|addMonths)\s*\((?:[^()]|\([^()]*\))*\)|now\(\))")
 
 
+def _is_date_result_call(s):
+    """整段是否恰为「返回 Date 的调用」(括号按配对判断,不限嵌套层数)。"""
+    if _DATE_RESULT_CALL_RE.match(s):
+        return True
+    m = re.match(r"(?i)(?:monthStart|monthEnd|quarterStart|quarterEnd|yearStart|yearEnd|"
+                 r"addDays|addMonths)\s*\(", s)
+    if not m:
+        return False
+    args, end = _balanced_args(s, m.end() - 1)
+    return args is not None and end == len(s)
+
+
 def _stringify_date_results_in_concat(tmp):
     """CONCATENATE(...) 顶层实参若整段恰好是上面枚举的「返回 Date 对象」调用,
     包成 formatDate(expr,"yyyy-MM-dd")。仅整段匹配才改写,避免误伤日期算术里的子表达式
@@ -339,7 +373,7 @@ def _stringify_date_results_in_concat(tmp):
         new_args = []
         for a in args:
             s = a.strip()
-            if _DATE_RESULT_CALL_RE.match(s):
+            if _is_date_result_call(s):
                 new_args.append(' formatDate(%s, "yyyy-MM-dd")' % s)
                 changed = True
             else:
@@ -386,6 +420,14 @@ def translate_expression(expr):
         return "\x00%d\x00" % (len(strings) - 1)
     tmp = re.sub(r"'(?:[^'\\]|\\.)*'|\"(?:[^\"\\]|\\.)*\"", _stash, expr)
 
+    # 0a) 帆软容忍函数实参留空:if(c,"诊间代挂号",) / if(c,,"x") 视为空串;magic 直接
+    #     ExpressionParseException 整张报表崩(真机:宁远 挂号信息查询 A4)。空位补 ""。
+    for _ in range(3):
+        tmp2 = re.sub(r"(?<=[(,])(\s*)(?=,)|(?<=,)(\s*)(?=\))", '""', tmp)
+        if tmp2 == tmp:
+            break
+        tmp = tmp2
+
     # 0b) 帆软花括号包单元格引用 {J4} / {J4:K5} → magic 裸引用 J4 / J4:K5。
     # 真机实证:高值耗材销毁登记册 J5=`sum({J4})`,magic 解析「期待 identifier 获得 J4」整张报表崩。
     tmp = re.sub(r"\{([A-Z]{1,2}\d+(?::[A-Z]{1,2}\d+)?)\}", r"\1", tmp)
@@ -396,12 +438,17 @@ def translate_expression(expr):
     tmp = re.sub(r"(?<![=<>!])=(?!=)", "==", tmp)
 
     T = r"(?:TODAY|today)\s*\(\s*\)"  # 帆软 TODAY()
+    # 1c) TODAY()-DAY(TODAY()) = 上月最后一天(常见于「上月初/上月末」默认值)。必须在 TODAY
+    #     落成字符串 date() 之前改写为日期运算,否则得 date()-day(date())(字符串减法,参数
+    #     默认值计算失败;真机:宁远 JingMaiShuYeSyl)。
+    tmp = re.sub(r"(?i)%s\s*-\s*DAY\s*\(\s*%s\s*\)" % (T, T),
+                 "addDays(now(), -day(now()))", tmp)
     # 2) 日期函数包裹 TODAY:这些场景 TODAY 需当作「日期对象」→ now()
     tmp = re.sub(r"(?i)\bDATEINMONTH\s*\(\s*%s\s*,\s*-\s*1\s*\)" % T, "monthEnd(now())", tmp)
     tmp = re.sub(r"(?i)\bDATEINMONTH\s*\(\s*%s\s*,\s*1\s*\)" % T, "monthStart(now())", tmp)
     # 首参允许两层嵌套括号(如 addMonths(now(),-1)、today()-day(today())),否则这些复杂首参
     # 的 DATEINMONTH 不被匹配→残留未译函数、用在参数默认里会整张报表加载崩。
-    _A = r"((?:[^,()]|\((?:[^()]|\([^()]*\))*\))+?)"
+    _A = r"((?:[^,()]|\((?:[^()]|\((?:[^()]|\([^()]*\))*\))*\))+?)"   # 实参内最多三层括号
     tmp = re.sub(r"(?i)\bDATEINMONTH\s*\(%s,\s*-\s*1\s*\)" % _A, r"monthEnd(\1)", tmp)
     tmp = re.sub(r"(?i)\bDATEINMONTH\s*\(%s,\s*1\s*\)" % _A, r"monthStart(\1)", tmp)
     # 单参 DATEINMONTH(日期)= 该日期本身(其月内不指定日序号即不改日);magic 无此函数,直接取
@@ -435,6 +482,8 @@ def translate_expression(expr):
     tmp = _swap_find_args(tmp)
     # 3.6) SWITCH → 嵌套三元(magic 无 switch;详见 _expand_switch)
     tmp = _expand_switch(tmp)
+    # 3.7) 多条件 IF(c1,v1,c2,v2,…[,默认]) → 嵌套 if(magic 的 if 只收 3 个参数)
+    tmp = _expand_multi_if(tmp)
 
     # 4) FORMAT(x, "格式") → 按格式串判定 formatNumber / formatDate
     def _format(m):
@@ -1036,6 +1085,11 @@ def _parse_query_panel(root, datasets=None):
         mtype = WIDGET_TYPE.get(kind)
         name = _child_attr(inner, "WidgetName", "name") or ""
         label = _child_attr(inner, "LabelName", "name") or ""
+        # 帆软「不可见」控件(<WidgetAttr invisible="true">):多为 JS 中转/操作员id/重复的旧控件。
+        # 原样渲染会在参数面板冒出空框、重复标签,还把查询按钮挤到最右(真机:宁远 抗菌药物使用情况)。
+        # 只保留参数声明与默认值,不出组件。
+        wattr = next((e for e in inner if local(e.tag) == "WidgetAttr"), None)
+        hidden = wattr is not None and str(wattr.get("invisible", "")).lower() == "true"
         js_unknown, js_setv, js_export = _js_classify(inner)
         if js_unknown:
             issues.append(Issue("manual", "查询面板:" + (name or label or kind),
@@ -1064,8 +1118,9 @@ def _parse_query_panel(root, datasets=None):
                     if name:
                         meta[name] = {"datatype": "String", "default": None,
                                       "default_expr": False, "required": tprops.get("required", False)}
-                    params.append({"type": "tree-select", "name": name, "label": label,
-                                   "pos": _bounds(bounds), "props": tprops})
+                    if not hidden:
+                        params.append({"type": "tree-select", "name": name, "label": label,
+                                       "pos": _bounds(bounds), "props": tprops})
                     if issues is not None:
                         how = ("懒加载(%d 层,按需取子)" % tree["levels"]) if lazy else \
                               ("UNION 扁平,数据集 %s" % tree["ds"])
@@ -1081,6 +1136,8 @@ def _parse_query_panel(root, datasets=None):
                                     "查询控件 %s 暂不支持,需手工加" % kind))
             continue
         pos = _bounds(bounds)
+        if hidden and mtype in ("text", "query"):
+            continue
         if mtype == "text":
             labels.append({"content": _widget_text(inner) or label, "pos": pos})
             continue
@@ -1090,7 +1147,7 @@ def _parse_query_panel(root, datasets=None):
             continue
         # 跳过隐藏辅助控件:极窄(<35px)文本/数字框几乎都是帆软 JS 驱动的隐藏字段(操作员id/
         # 级联中转),转换后会变成可见小方框搅乱排版。跳过组件、保留参数(走其默认值),并标注。
-        if mtype in ("input", "number") and pos["width"] < 35:
+        if mtype in ("input", "number") and pos["width"] < 35 and not hidden:
             issues.append(Issue("info", "查询面板:" + (name or label or kind),
                                 "隐藏辅助控件(宽 %dpx,多为JS驱动)已自动跳过渲染,如需可在设计器补回"
                                 % pos["width"]))
@@ -1136,9 +1193,22 @@ def _parse_query_panel(root, datasets=None):
                  else "Number" if mtype == "number"
                  else "Boolean" if mtype == "switch"
                  else "List" if mtype in ("multiselect", "checkbox") else "String")
+        if dtype in ("Date", "DateTime") and default and not is_expr:
+            # 帆软常用 2000-00-00 之类「占位」日期;Sight 解析非法日期 → 报表参数计算错误
+            _dm = re.match(r"\s*(\d{4})[-/](\d{1,2})[-/](\d{1,2})", str(default))
+            if _dm and not (1 <= int(_dm.group(2)) <= 12 and 1 <= int(_dm.group(3)) <= 31):
+                issues.append(Issue("degraded", "查询面板:" + (name or label),
+                                    "默认值「%s」不是合法日期,已清空,请在设计器补合理默认值" % default))
+                default = None
         if name:
             meta[name] = {"datatype": dtype, "default": default,
-                          "default_expr": is_expr, "required": props.get("required", False)}
+                          "default_expr": is_expr,
+                          # 隐藏控件用户填不了,必填会让报表永远查不了
+                          "required": props.get("required", False) and not hidden}
+        if hidden:
+            issues.append(Issue("info", "查询面板:" + (name or label or kind),
+                                "帆软隐藏控件,已只保留参数(含默认值)、不在查询面板显示"))
+            continue
         params.append({"type": mtype, "name": name, "label": label, "pos": pos, "props": props})
 
     # afterinit 里 setValue 设的初始值:控件自己没配默认值时当作参数默认值
@@ -1384,6 +1454,11 @@ def _widget_default(inner):
     if "Formula" in o.get("class", ""):
         raw = "".join(next((e for e in o if local(e.tag) == "Attributes"), o)
                       .itertext()).strip().lstrip("=").strip()
+        # =("2000-01-01") / ="xx":公式其实只是一个字符串常量 → 当普通默认值
+        # (括号包字面量在参数默认值链路里会被当表达式求值失败;真机:宁远 住院动态统计)
+        lit = re.fullmatch(r"\(*\s*([\"'])(.*?)\1\s*\)*", raw, re.S)
+        if lit and raw.count("(") == raw.count(")"):
+            return lit.group(2), False
         return translate_expression(raw)[0], True
     return "".join(o.itertext()).strip(), False
 
@@ -1698,8 +1773,10 @@ def _parse_cell(C, cells, styles, datasets, issues):
         # 帆软显式父格(leftParentDefault=false → left;upParentDefault=false → up)
         if Expand.get("leftParentDefault") == "false" and Expand.get("left"):
             cell["left"] = Expand.get("left")
+            cell["_fr_left"] = True
         if Expand.get("upParentDefault") == "false" and Expand.get("up"):
             cell["top"] = Expand.get("up")
+            cell["_fr_top"] = True
     if cell["agg"] in AGG_NUMERIC:
         cell["expand"] = "none"
     if HList is not None:
@@ -2214,6 +2291,9 @@ def _parse_cell_content(O, cell, datasets, issues):
             cur = datasets[dsName]["fields"].get(field, "String")
             datasets[dsName]["fields"][field] = (
                 "Number" if agg in AGG_NUMERIC else cur)
+    elif t == "RichText":
+        _parse_rich_text(O, cell, issues)
+        return
     elif "Formula" in cls:
         expr = "".join(next((ch for ch in O if local(ch.tag) == "Attributes"),
                             O).itertext()).strip().lstrip("=").strip()
@@ -2231,9 +2311,90 @@ def _parse_cell_content(O, cell, datasets, issues):
                 issues.append(Issue("info", cellref(cell["r"], cell["c"]),
                                     "帆软斜线头「%s」已转为斜线表头单元格(SightReport 斜线固定为左上→右下)" % txt))
                 return
-        if t in ("RichText", "BiasTextPainter"):
+        if t == "BiasTextPainter":
             issues.append(Issue("manual", cellref(cell["r"], cell["c"]),
-                                "帆软富文本/斜线头(%s)仅提取纯文本,样式需手工还原" % t))
+                                "帆软斜线头(%s)仅提取纯文本,样式需手工还原" % t))
+
+
+def _rich_text_raw(O):
+    """富文本 → 纯文本。帆软结构 <RichText><RichChar><text>\n<![CDATA[片段]]></text></RichChar>…;
+    旧实现 "".join(itertext()) 把元素间的缩进换行也拼进去 → 每个片段之间多出几个空行
+    (真机:「统计时间:」「${=$startTime}」「至」…被拆成 4 行铺满整个表头)。
+    只取各 <text> 的内容,并去掉 CDATA 前那个格式化换行。"""
+    parts = []
+    for e in O.iter():
+        if local(e.tag) != "text":
+            continue
+        v = "".join(e.itertext())
+        if v.startswith("\r\n"):
+            v = v[2:]
+        elif v.startswith("\n"):
+            v = v[1:]
+        parts.append(v)
+    if not parts:                       # 非常规结构:退回整体文本(至少不丢字)
+        return "".join(O.itertext()).strip()
+    return "".join(parts).strip("\r\n")
+
+
+def _magic_str(lit):
+    return '"%s"' % (lit.replace("\\", "\\\\").replace('"', '\\"')
+                     .replace("\r\n", "\n").replace("\n", "\\n"))
+
+
+def _parse_rich_text(O, cell, issues):
+    """帆软富文本单元格:纯文本片段 + 内嵌公式 ${=表达式}。
+    含公式 → 译成 magic 拼接表达式 "统计时间:" + $startTime + "至" + $endTime
+    (日期参数随后由 wrap_date_params_in_concat 补 formatDate);不含 → 纯文本。"""
+    txt = _rich_text_raw(O)
+    where = cellref(cell["r"], cell["c"])
+    pieces, pos = [], 0
+    for m in re.finditer(r"\$\{=", txt):
+        if m.start() < pos:
+            continue
+        # 找与 ${= 配对的 }(跳过表达式里的字符串与嵌套花括号)
+        depth, i, q = 1, m.end(), None
+        while i < len(txt) and depth:
+            ch = txt[i]
+            if q:
+                if ch == "\\":
+                    i += 1
+                elif ch == q:
+                    q = None
+            elif ch in "\"'":
+                q = ch
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+            i += 1
+        if depth:
+            break
+        if m.start() > pos:
+            pieces.append(("lit", txt[pos:m.start()]))
+        pieces.append(("expr", txt[m.end():i - 1].strip()))
+        pos = i
+    if not any(k == "expr" for k, _ in pieces):
+        cell.update(kind="text", text=txt)
+        issues.append(Issue("info", where, "帆软富文本已转纯文本,字号/颜色等局部样式需手工还原"))
+        return
+    if pos < len(txt):
+        pieces.append(("lit", txt[pos:]))
+    out, unknown = [], set()
+    for k, v in pieces:
+        if k == "lit":
+            if v:
+                out.append(_magic_str(v))
+        else:
+            e, unk = translate_expression(v.lstrip("=").strip())
+            unknown |= unk
+            out.append(e if re.fullmatch(r"[$\w.]+(\(\))?", e) else "(%s)" % e)
+    if out and out[0].startswith("$") and len(out) > 1:
+        out.insert(0, '""')            # 首项是参数时先接空串,确保按字符串拼接
+    expr = guard_zero_division(" + ".join(out))
+    cell.update(kind="expression", text=expr)
+    issues.append(Issue("degraded" if unknown else "info", where,
+                        "帆软富文本内嵌公式已转为拼接表达式%s;局部样式需手工还原"
+                        % ("(含未映射函数 %s,需复核)" % "、".join(sorted(unknown)) if unknown else "")))
 
 
 def _set_expression(cell, expr, issues):
@@ -2495,6 +2656,75 @@ def _report_link_issues(cells, cfg, issues):
                              "和参数;请在设计器链接里选择目标报表,或配置 link_file_map 后重转" % path)))
 
 
+def _sanitize_parents(cells, subordinate, issues):
+    """父格引用兜底(引擎对这几类直接报错、整张报表打不开):
+    ①指向被合并吸收的位置 → 改指合并主格;②指向不存在/空的格 → none;
+    ③指向自己 → none;④显式父格链成环(如 序号 A5.left=B5 而 B5 又被挂回 A5,报
+      「单元格[A5]和[A5]左父格间存在循环依赖」)→ 断开环上一条边,优先断转换器推出来的边。"""
+    by_name = {"%s%d" % (col_letter(c["c"] + 1), c["r"] + 1): c for c in cells.values()}
+
+    def _pos(ref):
+        m = re.fullmatch(r"([A-Z]{1,2})(\d+)", ref or "")
+        if not m:
+            return None
+        cc = 0
+        for ch in m.group(1):
+            cc = cc * 26 + ord(ch) - 64
+        return int(m.group(2)) - 1, cc - 1
+
+    for name, cell in by_name.items():
+        for k in ("left", "top"):
+            v = cell.get(k)
+            if not v or v in ("default", "none"):
+                continue
+            p = _pos(v)
+            if p in subordinate:
+                mr, mc = subordinate[p]
+                v = cell[k] = "%s%d" % (col_letter(mc + 1), mr + 1)
+                p = (mr, mc)
+            tgt = cells.get(p) if p else None
+            if v == name or tgt is None or tgt["kind"] == "empty":
+                why = "指向自己" if v == name else "指向空格/不存在的格 %s" % v
+                cell[k] = "none"
+                issues.append(Issue("info", name, "%s父格%s,已改为无父格"
+                                    % ("左" if k == "left" else "上", why)))
+
+    # 环检测(左、上父格合成一张图)
+    def _edges(n):
+        c = by_name[n]
+        return [(k, c[k]) for k in ("left", "top")
+                if c.get(k) not in (None, "default", "none") and c[k] in by_name]
+    for _ in range(50):
+        color, cyc = {}, None
+
+        def dfs(n, path):
+            nonlocal cyc
+            color[n] = 1
+            for k, t in _edges(n):
+                if cyc:
+                    return
+                if color.get(t) == 1:
+                    i = [x[0] for x in path].index(t) if t in [x[0] for x in path] else 0
+                    cyc = path[i:] + [(n, k)]
+                    return
+                if color.get(t) is None:
+                    dfs(t, path + [(n, k)])
+            color[n] = 2
+        for n in by_name:
+            if color.get(n) is None and not cyc:
+                dfs(n, [])
+        if not cyc:
+            break
+        edges = [(n, k) for n, k in cyc if k]
+        pick = next(((n, k) for n, k in edges
+                     if not by_name[n].get("_fr_" + k)), edges[-1])
+        n, k = pick
+        issues.append(Issue("info", n, "%s父格 %s 与其它格成环(%s),已断开"
+                            % ("左" if k == "left" else "上", by_name[n][k],
+                               "→".join(x for x, _ in cyc))))
+        by_name[n][k] = "none"
+
+
 def _process_grid(sm, cfg, issues):
     """网格级处理(裁空、引用撑格、父格纠偏、日期公式包裹),返回处理后网格与几何。
     单 sheet 与多页签(每 sheet)共用此函数,保证两条路网格语义完全一致。"""
@@ -2549,6 +2779,31 @@ def _process_grid(sm, cfg, issues):
             if rr < max_r + 6 and cc < max_c + 6:
                 need_r, need_c = max(need_r, rr + 1), max(need_c, cc + 1)
     max_r, max_c = need_r, need_c
+
+    # ⭐合并区互相压叠:帆软本身不允许,但版面整理(标题撑到主体宽)/裁剪后可能出现「合并格盖住
+    # 另一个有内容的格」。被盖的格成了 invisible 占位,它自己的合并区又标成被合并 → 引擎找不到
+    # 覆盖该位置的主格,报「不能找到位于行[x]、列[y]上的单元格」(真机:宁远 非医嘱离院及死亡病历明细)。
+    # 按行列序把先出现的合并格收缩到不盖住后面的内容格。
+    for cell in sorted(cells.values(), key=lambda x: (x["r"], x["c"])):
+        if cell["kind"] == "empty" or (cell["cs"] == 1 and cell["rs"] == 1):
+            continue
+        r0, c0 = cell["r"], cell["c"]
+        for o in cells.values():
+            if o is cell or o["kind"] == "empty":
+                continue
+            if r0 <= o["r"] < r0 + cell["rs"] and c0 <= o["c"] < c0 + cell["cs"]:
+                if o["r"] == r0:
+                    cell["cs"] = o["c"] - c0
+                else:
+                    cell["rs"] = o["r"] - r0
+                issues.append(Issue("info", cellref(r0, c0),
+                                    "合并区与 %s 重叠,已收缩合并范围" % cellref(o["r"], o["c"])))
+    for k_ in [k for k, v in cells.items() if v["kind"] == "empty"]:
+        v = cells[k_]
+        if any(o is not v and o["kind"] != "empty"
+               and o["r"] <= v["r"] < o["r"] + o["rs"] and o["c"] <= v["c"] < o["c"] + o["cs"]
+               for o in cells.values()):
+            del cells[k_]          # 落在别人合并区里的空格,不能再当主格发射
 
     subordinate = {}
     for (r, c), cell in cells.items():
@@ -2652,6 +2907,8 @@ def _process_grid(sm, cfg, issues):
         # 报「无法处理单元格依赖关系」=序号 left=姓名 + 数据列默认左父链回序号 的环)。
         cell["left"] = ("%s%d" % (col_letter(dim["c"] + 1), dim["r"] + 1)
                         if dim is not None else "none")
+
+    _sanitize_parents(cells, subordinate, issues)
 
     # ⭐横向交叉表的「全宽 banner 行」(标题/统计时段等):必须 columnAutoStretch=true。
     # 引擎实证(RightColumnExpanderProcessor):右扩展时,扩展行之上、无左父格、全宽的表头格
@@ -3068,8 +3325,9 @@ def _emit_cell(cell, cfg):
             for _i, _f in enumerate(cell["filters"]):
                 _ca = {"itemType": "common", "leftValue": _f["left"], "operator": _f["op"],
                        "rightValueType": _f["rtype"], "rightValue": _f["right"]}
-                if _i:
-                    _ca = dict({"joinType": "and"}, **_ca)
+                # 每条都必须带 joinType(首条也要):后端 Join.valueOf(null) 抛 NPE →
+                # 「Error parsing dataset content definition」整张报表打不开(真机:NY029 病区交班表)
+                _ca = dict({"joinType": "and"}, **_ca)
                 s.append('                <condition %s />' % attr(_ca))
             s.append('            </filterCondition>')
             s.append('        </datasetContent>')
