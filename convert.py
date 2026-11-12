@@ -134,12 +134,14 @@ FR_SAFE = {
     # 专项重写后会产生的 magic 名,需被接受(避免二次误判)
     "formatnumber": "formatNumber", "formatdate": "formatDate",
     "monthstart": "monthStart", "monthend": "monthEnd",
+    "yearstart": "yearStart", "yearend": "yearEnd",
     "quarterstart": "quarterStart", "quarterend": "quarterEnd",
     "adddays": "addDays", "addmonths": "addMonths", "length": "length",
     "isnull": "isNull",
     # 重写产出的 magic 函数名,放行避免二次误判:.split() 原生方法 / arrayGet 安全取元素 /
     # datasetSelect 数据集筛选取数(后端 sight-report 新增)
     "split": "split", "arrayget": "arrayGet", "datasetselect": "datasetSelect",
+    "dataset": "dataset", "isempty": "isEmpty",
 }
 # 改名类(参数语义一致,仅名字不同)
 FR_RENAME = {
@@ -420,6 +422,17 @@ def translate_expression(expr):
         return "\x00%d\x00" % (len(strings) - 1)
     tmp = re.sub(r"'(?:[^'\\]|\\.)*'|\"(?:[^\"\\]|\\.)*\"", _stash, expr)
 
+    # 0-) 字符串外的全角括号/逗号(帆软容错,magic 报 Unknown token,真机:ChuYuanHuanZheLuJingSS
+    #     「（F4-G4）」);帆软 $$参数 写法(多一个 $,帆软照样取参数)→ $参数(真机:主治医师48小时完成情况
+    #     「$$kaishiriqi」被拼成 $formatDate(...) → 找不到函数 $formatDate)。$$$ 自引用不动。
+    tmp = tmp.replace("（", "(").replace("）", ")").replace("，", ",")
+    tmp = re.sub(r"(?<!\$)\$\$(?=[A-Za-z_一-鿿])", "$", tmp)
+    # 帆软公式末尾多余的 }(源模板笔误,帆软容错;magic 报 Expected a variable…)
+    while tmp.rstrip().endswith("}") and tmp.count("}") > tmp.count("{"):
+        tmp = tmp.rstrip()[:-1]
+    # 层次坐标 K4[!0;!0](双向全部)→ magic 只支持 [!0](真机:术前讨论完成率)
+    tmp = re.sub(r"\[\s*!0\s*;\s*!0\s*\]", "[!0]", tmp)
+
     # 0a) 帆软容忍函数实参留空:if(c,"诊间代挂号",) / if(c,,"x") 视为空串;magic 直接
     #     ExpressionParseException 整张报表崩(真机:宁远 挂号信息查询 A4)。空位补 ""。
     for _ in range(3):
@@ -444,6 +457,11 @@ def translate_expression(expr):
     tmp = re.sub(r"(?i)%s\s*-\s*DAY\s*\(\s*%s\s*\)" % (T, T),
                  "addDays(now(), -day(now()))", tmp)
     # 2) 日期函数包裹 TODAY:这些场景 TODAY 需当作「日期对象」→ now()
+    # DATEINMONTH(YEAR(),1)(帆软把年份数当日期,作者本意=今年 1 月 1 日)→ yearStart(now());
+    # 不改会成 monthStart(year(now())) → monthStart(2026) 返回 null → 「date must not be null」
+    # (真机:ZyCx_BingZhongShouShuTjXx nianfen)
+    tmp = re.sub(r"(?i)\bDATEINMONTH\s*\(\s*YEAR\s*\(\s*(?:now\s*\(\s*\)\s*)?\)\s*,\s*1\s*\)", "yearStart(now())", tmp)
+    tmp = re.sub(r"(?i)\bDATEINMONTH\s*\(\s*YEAR\s*\(\s*(?:now\s*\(\s*\)\s*)?\)\s*,\s*-\s*1\s*\)", "yearEnd(now())", tmp)
     tmp = re.sub(r"(?i)\bDATEINMONTH\s*\(\s*%s\s*,\s*-\s*1\s*\)" % T, "monthEnd(now())", tmp)
     tmp = re.sub(r"(?i)\bDATEINMONTH\s*\(\s*%s\s*,\s*1\s*\)" % T, "monthStart(now())", tmp)
     # 首参允许两层嵌套括号(如 addMonths(now(),-1)、today()-day(today())),否则这些复杂首参
@@ -500,6 +518,10 @@ def translate_expression(expr):
     # 5.5) 数组函数 SPLIT/INDEXOFARRAY(空值/越界安全)+ 数据集 .select(简单等值) 取数
     tmp = _rewrite_array_funcs(tmp)
     tmp = _rewrite_select(tmp)
+    # 5.6) ARRAY(a,b,..) → [a,b,..];VALUE(数据集,列[,行]) → dataset(..)/arrayGet(dataset(..),行-1);
+    #      year/month/day(date()) → (now())(date() 在 magic 里是字符串,year(String) 找不到函数)
+    tmp = _rewrite_value_array(tmp)
+    tmp = re.sub(r"(?i)\b(year|month|day)\s*\(\s*date\s*\(\s*\)\s*\)", r"\1(now())", tmp)
 
     # 6) 通用函数名归一:仅 FR_ACCEPT 内的算干净,其余标红
     unknown = set()
@@ -513,9 +535,76 @@ def translate_expression(expr):
         return name + paren
     tmp = re.sub(r"\b([A-Za-z_]\w*)(\s*\()", _repl, tmp)
 
+    # 6.5) length(x) 与 0 比较 = 判空。magic length 只认字符串,帆软 LEN 对 List/数字/空集都能算,
+    #      直接映射会「找不到函数 length(EmptyList/Long/BigDecimal)」(真机 20+ 张)。
+    #      判空统一写成 (isEmpty(x) || x == '')(isEmpty("") 在该运行时返 false,见 translate_sql)。
+    def _len0(m):
+        x, op, n = m.group(1), m.group(2), m.group(3)
+        empty = "(isEmpty(%s) || %s == \x00Q\x00)" % (x, x)
+        is_empty = (op in ("==", "<=") and n == "0") or (op == "<" and n == "1")
+        return empty if is_empty else "!" + empty
+    tmp = re.sub(r"\blength\s*\(\s*(\$?[\w一-鿿.]+)\s*\)\s*(==|!=|<>|>=|<=|>|<)\s*([01])\b(?!\.)",
+                 lambda m: _len0(m) if (m.group(3) == "0" or m.group(2) in (">=", "<")) else m.group(0), tmp)
+    # 6.6) 「(if(...))」外层多余括号:magic 解析器把 `(标识符` 当 lambda 形参,if 是关键字
+    #      → 「变量名不能定义为关键字」(真机:挂号信息查询 D5、CwTj_RuKuMxBb C3 等 7 张)
+    tmp = _strip_paren_around_if(tmp)
+    # 6.7) 整段以 if(...) 开头、后面还接运算(if(c,a,b) + "x"):magic 在语句级把 if(...) 解析成
+    #      独立语句,后面的 + "x" 成了另一条语句,编译出错「Operand stack underflow」
+    #      (真机:CwTj_YaoPinGysJyTj)。改写成三元 ((c) ? (a) : (b)) + "x"。
+    _ms = re.match(r"\s*if\s*\(", tmp)
+    if _ms:
+        _args, _end = _balanced_args(tmp, _ms.end() - 1)
+        if _args and len(_args) == 3 and tmp[_end:].strip():
+            tmp = "((%s) ? (%s) : (%s))" % tuple(a.strip() for a in _args) + tmp[_end:]
+
     # 7) 还原字符串
     out = re.sub(r"\x00(\d+)\x00", lambda m: strings[int(m.group(1))], tmp)
+    out = out.replace("\x00Q\x00", "''")
     return out, unknown
+
+
+def _rewrite_value_array(tmp):
+    """ARRAY(..) → [..];VALUE(ds, col[, row]) → dataset(ds, col) / arrayGet(dataset(ds, col), row - 1)。"""
+    for _ in range(8):
+        m = re.search(r"(?i)(?<![\w$.])(array|value)\s*\(", tmp)
+        if not m:
+            break
+        args, end = _balanced_args(tmp, m.end() - 1)
+        name = m.group(1).lower()
+        if args is None:
+            break
+        args = [a.strip() for a in args]
+        if name == "array":
+            rep = "[%s]" % ", ".join(a for a in args if a)
+        elif len(args) == 2:
+            rep = "dataset(%s, %s)" % (args[0], args[1])
+        elif len(args) == 3 and args[2]:
+            rep = "arrayGet(dataset(%s, %s), %s - 1)" % (args[0], args[1], args[2])
+        else:
+            tmp = tmp[:m.start()] + m.group(1) + "\x07" + tmp[m.end() - 1:]
+            continue
+        tmp = tmp[:m.start()] + rep + tmp[end:]
+    return tmp.replace("\x07", "")
+
+
+def _strip_paren_around_if(tmp):
+    """去掉恰好包住一个 if(...) 调用的那层括号:`(if(a,b,c))` → `if(a,b,c)`。"""
+    for _ in range(20):
+        changed = False
+        for m in re.finditer(r"\(\s*if\s*\(", tmp):
+            args, end_if = _balanced_args(tmp, m.end() - 1)
+            if args is None:
+                continue
+            k = end_if
+            while k < len(tmp) and tmp[k] == " ":
+                k += 1
+            if k < len(tmp) and tmp[k] == ")":
+                tmp = tmp[:m.start()] + tmp[m.start() + 1:k] + tmp[k + 1:]
+                changed = True
+                break
+        if not changed:
+            break
+    return tmp
 
 
 # 单元格引用做除数的「除零」防护。
@@ -636,12 +725,230 @@ def sql_lint(sql):
     return probs
 
 
+# 片段/列名位置判定用:这些词之后跟 ${p} 时 ${p} 是值,不是片段
+_SQL_WORDS = {
+    "select", "from", "where", "and", "or", "not", "on", "in", "is", "like", "ilike",
+    "between", "then", "else", "when", "case", "end", "by", "as", "set", "values",
+    "limit", "offset", "join", "having", "union", "all", "exists", "any", "some",
+    "return", "interval", "distinct", "with", "over", "partition", "into", "update",
+    "delete", "insert", "escape", "asc", "desc", "nulls", "top", "elsif", "if",
+    "null", "date", "timestamp", "time",
+}
+
+
+def _mask_to_java(mask):
+    """Oracle/PG 日期掩码 → Java SimpleDateFormat 模式(yyyy-mm-dd hh24:mi:ss → yyyy-MM-dd HH:mm:ss)。"""
+    out = []
+    i, m = 0, mask or ""
+    low = m.lower()
+    table = (("yyyy", "yyyy"), ("hh24", "HH"), ("hh12", "hh"), ("yy", "yy"), ("mm", "MM"),
+             ("dd", "dd"), ("hh", "HH"), ("mi", "mm"), ("ss", "ss"), ("ff3", "SSS"), ("ff", "SSS"))
+    while i < len(m):
+        for k, v in table:
+            if low.startswith(k, i):
+                out.append(v)
+                i += len(k)
+                break
+        else:
+            ch = m[i]
+            out.append("'%s'" % ch if ch.isalpha() else ch)
+            i += 1
+    return "".join(out)
+
+
+def _skip_braced(s, i):
+    """s[i:] 以 '${' 或 '#{' 开头,返回配平的收尾 '}' 之后的下标(跳过内部 "..." / '...' 字符串)。"""
+    depth, j, n = 0, i + 1, len(s)
+    while j < n:
+        ch = s[j]
+        if ch in "\"'":
+            k = j + 1
+            while k < n and s[k] != ch:
+                k += 2 if s[k] == "\\" else 1
+            j = k + 1
+            continue
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return j + 1
+        j += 1
+    return n
+
+
+def _quoted_param_prepass(sql, date_params, date_fmt, unknown):
+    """引号内带参数的 SQL 字面量预处理(帆软是文本内联,magic 引号内的 $p/${} 一律不替换)。
+
+    ① to_timestamp/to_date('<含 ${p}>', '掩码') → to_timestamp(${表达式}, '掩码'):
+       日期参数用 formatDate($p, 掩码对应模式) 转成字符串再绑定(字符串参数 formatDate 原样返回)。
+       不再像旧实现那样剥掉 to_timestamp:剥掉后 `$d + 1` / `$d - interval '24 hour'` 里
+       ? 的类型推断成 integer/interval → operator does not exist: timestamp <= integer
+       (真机:CPFeiYongCX、ZhuYuanDongtaiCX、LuJingFeiYongMX_* 共 30+ 张)。
+    ② 其它带空格/冒号等前后缀的字面量('${p} 23:59:59'、INTERVAL '${n} minutes'、多个参数)
+       → 字面量内联 '#{formatDate($p,"yyyy-MM-dd")} 23:59:59':保持 SQL 字面量(unknown 类型,
+       与 timestamp/varchar 列都能比较),与帆软文本内联语义一致
+       (真机:31日内非计划再入院 等 50+ 张 invalid value "$end" for "yyyy")。
+    纯 '${p}' / '%${p}%' 这类简单形态不在此处理,仍走原有 _qfix 规则。
+    返回 (新SQL, 暂存表);暂存项以 \\x05N\\x05 占位。
+    """
+    if not sql or "${" not in sql:
+        return sql, []
+    stash = []
+    out = []
+    i, n = 0, len(sql)
+
+    def _piece_expr(inner, whole, has_suffix):
+        inner = inner.strip()
+        if re.fullmatch(_IDENT, inner):
+            if inner in date_params:
+                # 按参数自身(控件)格式转文本 = 帆软内联进 SQL 的那串文本;掩码只在没有控件格式时兜底
+                pat = date_fmt.get(inner) or whole or "yyyy-MM-dd"
+                if has_suffix:
+                    pat = pat.split(" ")[0]
+                return 'formatDate($%s, "%s")' % (inner, pat)
+            return "$" + inner
+        expr, unk = _sql_expr(inner)
+        unknown.update(unk)
+        return "(%s)" % re.sub(r"\s+", " ", expr).strip()
+
+    while i < n:
+        ch = sql[i]
+        if sql.startswith("--", i):
+            j = sql.find("\n", i)
+            j = n if j < 0 else j
+            out.append(sql[i:j]); i = j; continue
+        if sql.startswith("/*", i):
+            j = sql.find("*/", i + 2)
+            j = n if j < 0 else j + 2
+            out.append(sql[i:j]); i = j; continue
+        if sql.startswith("${", i):
+            j = _skip_braced(sql, i)
+            out.append(sql[i:j]); i = j; continue
+        if ch != "'":
+            out.append(ch); i += 1; continue
+        # 字面量:找收尾引号('' 为转义),字面量内的 ${...} 整段跳过
+        j = i + 1
+        while j < n:
+            if sql.startswith("${", j):
+                j = _skip_braced(sql, j); continue
+            if sql[j] == "'":
+                if j + 1 < n and sql[j + 1] == "'":
+                    j += 2; continue
+                break
+            j += 1
+        body = sql[i + 1:j]
+        lit = sql[i:j + 1]
+        i = j + 1
+        if "${" not in body:
+            out.append(lit); continue
+        pieces = []          # (kind, text) kind: s=文本 p=参数正文
+        k = 0
+        while k < len(body):
+            a = body.find("${", k)
+            if a < 0:
+                pieces.append(("s", body[k:])); break
+            if a > k:
+                pieces.append(("s", body[k:a]))
+            b = _skip_braced(body, a)
+            pieces.append(("p", body[a + 2:b - 1]))
+            k = b
+        texts = "".join(t for kk, t in pieces if kk == "s")
+        nparam = sum(1 for kk, _ in pieces if kk == "p")
+        simple = nparam == 1 and re.fullmatch(r"[^'$\s();,]*", texts or "")
+        before = "".join(out)
+        m_fn = re.search(r"(?i)\bto_(?:timestamp|date)\s*\(\s*$", before)
+        m_mask = re.match(r"\s*,\s*'([^']*)'\s*\)", sql[i:]) if m_fn else None
+        if m_fn and m_mask:
+            jmask = _mask_to_java(m_mask.group(1))
+            parts = []
+            for idx, (kk, t) in enumerate(pieces):
+                if kk == "s":
+                    if t:
+                        parts.append("'%s'" % t.replace("\\", "\\\\").replace("'", "\\'"))
+                else:
+                    has_suf = any(k2 == "s" and t2.strip() for k2, t2 in pieces[idx + 1:])
+                    parts.append(_piece_expr(t, None if (has_suf or len(pieces) > 1) else jmask, has_suf))
+            stash.append("${%s}" % " + ".join(parts))
+            out.append("\x05%d\x05" % (len(stash) - 1))
+            continue
+        if simple:
+            _pn = pieces[0][1].strip() if (len(pieces) == 1 and pieces[0][0] == "p") else None
+            if _pn and re.fullmatch(_IDENT, _pn) and _pn in date_params:
+                # 纯 '${日期}':帆软内联的是控件格式的文本,SQL 侧既可能和 timestamp 列比、也可能和
+                # to_char(..) 文本比。绑成 ? 时 Date 对象只能当 timestamp,和文本比就
+                # operator does not exist: text >= timestamp。改为按格式内联字面量(日期串不含引号,
+                # 无注入面);空值内联 null(比较不成立,不报错)。
+                pat = date_fmt.get(_pn) or "yyyy-MM-dd"
+                stash.append('#{isEmpty($%s) ? "null" : "\'" + formatDate($%s, "%s") + "\'"}'
+                             % (_pn, _pn, pat))
+                _pre = " " if before and re.match(r"[\w一-鿿]", before[-1]) else ""
+                _suf = " " if i < n and re.match(r"[\w一-鿿]", sql[i]) else ""
+                out.append("%s\x05%d\x05%s" % (_pre, len(stash) - 1, _suf))
+                continue
+            out.append(lit); continue
+        # 内联:'前缀#{expr}后缀'
+        buf = ["'"]
+        for idx, (kk, t) in enumerate(pieces):
+            if kk == "s":
+                buf.append(t)
+            else:
+                has_suf = any(k2 == "s" and t2.strip() for k2, t2 in pieces[idx + 1:])
+                buf.append("#{%s}" % _piece_expr(t, None, has_suf))
+        buf.append("'")
+        stash.append("".join(buf))
+        out.append("\x05%d\x05" % (len(stash) - 1))
+    return "".join(out), stash
+
+
+def _neutralize_comment_fragments(sql):
+    """SQL 注释里的 #{...} 改写成 # {...}。
+
+    引擎先求值 #{} 动态片段、后去注释(DatasetSqlTemplate.resolve → build),所以被注释掉的
+    #{...} 照样会执行:帆软原 SQL 里注释掉的 ${if(...)} 一旦含引擎不认识的写法,整条 SQL
+    报「SQL处理错误」(真机:手术明细 `-- #{(if (...` )。注释本来就不该生效,拆开 #{ 即可。"""
+    if not sql or "#{" not in sql:
+        return sql
+    out, i, n = [], 0, len(sql)
+    while i < n:
+        if sql.startswith("#{", i) or sql.startswith("${", i):
+            j = _skip_braced(sql, i)
+            out.append(sql[i:j]); i = j; continue
+        ch = sql[i]
+        if ch == "'":
+            j = i + 1
+            while j < n:
+                if sql[j] == "'":
+                    if j + 1 < n and sql[j + 1] == "'":
+                        j += 2; continue
+                    break
+                j += 1
+            out.append(sql[i:j + 1]); i = j + 1; continue
+        if sql.startswith("--", i):
+            j = sql.find("\n", i)
+            j = n if j < 0 else j
+            out.append(sql[i:j].replace("#{", "# {")); i = j; continue
+        if sql.startswith("/*", i):
+            j = sql.find("*/", i + 2)
+            j = n if j < 0 else j + 2
+            out.append(sql[i:j].replace("#{", "# {")); i = j; continue
+        out.append(ch); i += 1
+    return "".join(out)
+
+
 def translate_sql(sql, ident_params=None, prequoted_params=None, date_params=None,
-                  multi_params=None, bool_params=None):
-    """帆软 SQL → magic SQL。返回 (新SQL, 未映射函数集)。"""
+                  multi_params=None, bool_params=None, date_fmt=None, frag_params=None):
+    """帆软 SQL → magic SQL。返回 (新SQL, 未映射函数集)。
+
+    date_fmt:  {日期参数名: Java 日期模式}(控件格式),字面量内联时格式化用;
+    frag_params: 值本身是 SQL 片段的参数(默认值形如 `is not null`、`in (...)`),整体内联 #{}。"""
     if not sql:
         return sql, set()
     unknown = set()
+    _dp = set(date_params or ()) | set(date_fmt or ())
+    # ⭐引号内含参数的字面量(带空格/冒号等后缀)、to_timestamp('${p}','掩码') 等先行改写,
+    # 结果暂存为 \x05N\x05 占位,后续规则一律不碰,函数末尾还原(见 _quoted_param_prepass)。
+    sql, _stash05 = _quoted_param_prepass(sql, _dp, date_fmt or {}, unknown)
 
     # ⭐帆软源码里 in (${p}) 未加引号 ≠ in ('${p}'):前者参数值本身就是「SQL 列表文本」
     # (如 fenlei 默认值 "1,2",帆软原样内联成 1 in (1,2)),不可再包引号 —— 包了就成
@@ -666,7 +973,38 @@ def translate_sql(sql, ident_params=None, prequoted_params=None, date_params=Non
     def _frag_bind(expr):
         """片段内拼接的参数值 → ${$p} 预编译绑定(A:SQL单引号包裹值; B:裸拼接如 in(...))"""
         expr = re.sub(r"'\"\s*\+\s*(\$[\w一-鿿]+)\s*\+\s*\"'", r"${\1}", expr)
+        # A':带前后缀的字面量(LIKE '%" + p + "%')→ ${'%' + $p + '%'} 整体绑定。
+        # 不处理会被下面 B 规则吃成 '%${$p}%' 再还原成 '%$p%' —— 引号内 $p 是普通文本,
+        # 条件静默失效或 SQL 报错(真机:VTE相关查询、MzTjBb_MenZhenFyMxCx XINGMING)。
+        _keep = []
+
+        def _k(txt):
+            _keep.append(txt)
+            return "\x06%d\x06" % (len(_keep) - 1)
+        expr = re.sub(r"'([^'\"\\]+)\"\s*\+\s*(\$[\w一-鿿]+)\s*\+\s*\"([^'\"\\]*)'",
+                      lambda m: _k("${'%s' + %s + '%s'}" % (
+                          m.group(1),
+                          # 这段 ${...} 位于 MagicScript 双引号串内,join 分隔符只能用单引号
+                          m.group(2) + (".join(',')" if m.group(2).lstrip("$") in (multi_params or ()) else ""),
+                          m.group(3))), expr)
+        expr = re.sub(r"'\"\s*\+\s*(\$[\w一-鿿]+)\s*\+\s*\"([^'\"\\]+)'",
+                      lambda m: _k("${%s + '%s'}" % (m.group(1), m.group(2))), expr)
+        # B':帆软 in ("+p+")(未加引号)= 参数值本身就是列表文本(1,2 / '59','60'),原样拼接,
+        # 不能再补引号(旧逻辑统一成 in ('"+p+"') → in (''59','60'') 语法错,真机:yaoFang_YaoPinXsPh);
+        # 多选参数(List)则 join 成 'a','b'。
+        def _raw_in(m):
+            pn = m.group(1)
+            if pn.lstrip("$") in (multi_params or ()):
+                return _k("in ('\" + " + pn + ".join(\"','\") + \"')")
+            return _k('in (" + ' + pn + ' + ")')
+        expr = re.sub(r"(?i)\bin\s*\(\s*\"\s*\+\s*(\$[\w一-鿿]+)\s*\+\s*\"\s*\)", _raw_in, expr)
         expr = re.sub(r"(['\"])\s*\+\s*(\$[\w一-鿿]+)\s*\+\s*\1", r"${\2}", expr)
+        # 多选参数直接参与字符串拼接(" order by " + $排序List)→ join(",");否则 List.toString 得「[a, b]」
+        expr = re.sub(r"(\+\s*)(\$[\w一-鿿]+)(?![\w一-鿿.(])",
+                      lambda m: m.group(1) + (m.group(2) + '.join(",")'
+                                              if m.group(2).lstrip("$") in (multi_params or ()) else m.group(2)),
+                      expr)
+        expr = re.sub(r"\x06(\d+)\x06", lambda m: _keep[int(m.group(1))], expr)
         return expr
 
     def _repl(m):
@@ -681,6 +1019,39 @@ def translate_sql(sql, ident_params=None, prequoted_params=None, date_params=Non
     # ⭐列名/表名位置的参数(如 f.${日期类型} 动态列名、schema.${表})→ 内联 #{$p};列名不可
     # 预编译绑定(f.? 非法 SQL),帆软是文本内联。仅当 ${IDENT} 紧跟 . 后(列/表引用位)才改。
     sql = re.sub(r"(?<=\.)\$\{([\w一-鿿]+)\}", r"#{$\1}", sql)
+    # ⭐值本身是 SQL 片段的参数:① 默认值形如 `is not null`/`in (..)`/`= 'x'`(frag_params);
+    # ② 位置判定——紧跟在列引用之后、中间无运算符(`c.bingrenksid ${kaiDanKs}`)。
+    # (条件左侧当列名用的 `and ${tongJiFs} between` 由 ident_params 按默认值 c.xxx 识别。)
+    # 帆软是文本内联,magic 须 #{} 内联,
+    # 绑成 ? 会得 `col ?` / `? between` → syntax error at or near "$4"(真机:ShouShuQieKouQkTj)。
+    _fp = set(frag_params or ())
+
+    def _frag_pos(m):
+        word, p = m.group(1), m.group(2)
+        if p in _fp or (word.lower() not in _SQL_WORDS and not word.isdigit()):
+            return m.group(0)[:m.start(2) - 2 - m.start(0)] + "#{$%s}" % p
+        return m.group(0)
+    sql = re.sub(r"(?<![\w$.'])([\w一-鿿.]*[\w一-鿿\])\]\"])\s+\$\{([A-Za-z_一-鿿][\w一-鿿]*)\}", _frag_pos, sql)
+    for _p in _fp:
+        sql = sql.replace("${%s}" % _p, "#{$%s}" % _p)
+    # ⭐裸 ${p}(源码没加引号)直接参与算术 / 与数字字面量比较:帆软是把数字文本原样内联
+    # (count(*)*${jixiao}、1 = ${zhenduan}、日期差 - ${tianshu}),magic 绑成 ? 是 varchar →
+    # operator does not exist: bigint * character varying / integer = character varying
+    # (真机:临床科室床日统计、慢性病病人查询、出院病人三日归档情况 等 20 张)。改成 CAST(? AS numeric)。
+    _skip_num = (_dp | set(ident_params or ()) | set(frag_params or ()) | set(multi_params or ())
+                 | set(bool_params or ()))
+    _P = r"\$\{([A-Za-z_一-鿿][\w一-鿿]*)\}"
+
+    def _num(m):
+        p = m.group("p")
+        if p in _skip_num:
+            return m.group(0)
+        _stash05.append("CAST(${$%s} AS numeric)" % p)
+        return m.group("pre") + "\x05%d\x05" % (len(_stash05) - 1) + m.group("suf")
+    sql = re.sub(r"(?P<pre>(?<![-*/+])[*/+]\s*|(?<!-)-\s*(?!-)|\b\d+(?:\.\d+)?\s*(?:[=<>]=?|<>|!=)\s*)"
+                 + _P.replace("(", "(?P<p>", 1) + r"(?P<suf>)", _num, sql)
+    sql = re.sub(r"(?P<pre>)" + _P.replace("(", "(?P<p>", 1)
+                 + r"(?P<suf>\s*(?:[*/+]|-(?!-)(?!\s*interval\b)|(?:[=<>]=?|<>|!=)\s*\d))", _num, sql)
     out = re.sub(r"\$\{([^}]*)\}", _repl, sql, flags=re.S)
     # 保护 #{} 片段,避免下面的引号处理误改其内部 ${} 绑定
     frags = []
@@ -688,7 +1059,6 @@ def translate_sql(sql, ident_params=None, prequoted_params=None, date_params=Non
                  lambda m: frags.append(m.group(0)) or "\x02%d\x02" % (len(frags) - 1),
                  out)
     # 预编译占位符不能裹在引号内(否则成 '?' 失去绑定):'${$x}'→${$x};'%${$x}%'→${'%'+$x+'%'}
-    _dp = date_params or set()
     # 布尔参数(帆软单 CheckBox → magic switch)与日期参数同样不可内联成 "'"+$p+"'":
     # 运行时值是 java Boolean,内联会得到字面量 'true' 去和布尔/数值列比较;维持 ? 绑定才对。
     _bp = bool_params or set()
@@ -721,11 +1091,22 @@ def translate_sql(sql, ident_params=None, prequoted_params=None, date_params=Non
     # 下一个 '${参}',把中间结构误裹进一个 ${...}→ 产出 '%x%${' 伪影、SQL 崩坏(真机:收入分类统计、
     # 门诊收费工作量统计;后者整段在同一行,故必须按「字面量内容字符集」而非「禁换行」来限定)。
     # 可选前导比较运算符(=、<>、!=、<、>、<=、>=)用于识别「值比较位」的纯引号参数→内联。
-    out = re.sub(r"(?:([=<>]=?|<>|!=)\s*)?'([^'$\s();,]*)\$\{(\$?[^}\s]*)\}([^'\s();,]*)'", _qfix, out)
+    def _qfix_sp(m):
+        # 去掉引号后与前后标识符粘连('${a}'and → ${$a}and)时补空格
+        r = _qfix(m)
+        st, en = m.string, m.end()
+        if en < len(st) and re.match(r"[\w一-鿿]", st[en]):
+            r += " "
+        if m.start() > 0 and re.match(r"[\w一-鿿]", st[m.start() - 1]) and not m.group(1):
+            r = " " + r
+        return r
+    # 算术运算符右侧的纯引号参数(日期差 - '${tianshu}')同理内联:帆软得到 - '3'(unknown→numeric),
+    # 绑成 varchar 则 bigint - character varying(真机:出院病人三日归档情况)。
+    out = re.sub(r"(?:([=<>]=?|<>|!=|[*/+]|(?<!-)-(?!-))\s*)?'([^'$\s();,]*)\$\{(\$?[^}\s]*)\}([^'\s();,]*)'", _qfix_sp, out)
     out = re.sub(r"\x02(\d+)\x02", lambda m: frags[int(m.group(1))], out)
     # 纯参数占位 ${$name} → $name(裸参形态,供下面 to_timestamp 剥离匹配;同时把 #{} 内的
     # ${$p} 简写成 $p——#{} 是 MagicScript,裸参才对)。
-    out = re.sub(r"\$\{(\$[\w一-鿿]+)\}", r"\1", out)
+    out = re.sub(r"\$\{(\$[\w一-鿿]+)\}(?![\w一-鿿])", r"\1", out)
     # ⭐多选参数(magic 多选下拉/弹窗→ArrayList)在动态 IN 片段的修复(仅 #{} 片段内):
     #  ① length($p)/len($p)==0 在 ArrayList 上报「找不到函数length(ArrayList)」(真机:入库明细 选多药品)
     #     → isEmpty($p) || $p == ''。⚠️真机实证 isEmpty("") 在该运行时返 false(未选的 String 型
@@ -762,6 +1143,12 @@ def translate_sql(sql, ident_params=None, prequoted_params=None, date_params=Non
 
     def _fix_multi_in(mm):
         frag = mm.group(0)
+        # translate_expression 已把 length($p)==0 / >0 改成 (isEmpty($p) || $p == '');
+        # 多选/布尔参数要换成对应的守卫(多选:join 判空;布尔:!= true)
+        frag = re.sub(r"\(isEmpty\((\$[\w一-鿿]+)\) \|\| \1 == ''\)",
+                      lambda m2: _empty_guard(m2)
+                      if (_is_multi(m2.group(1)) or m2.group(1).lstrip("$") in _bp) else m2.group(0),
+                      frag)
         frag = re.sub(r"(?i)\b(?:length|len)\s*\(\s*(\$[\w一-鿿]+)\s*\)\s*==\s*0",
                       _empty_guard, frag)
         frag = re.sub(r"(?i)\bin\s*\(\s*(\$[\w一-鿿]+)\s*\)",
@@ -775,9 +1162,12 @@ def translate_sql(sql, ident_params=None, prequoted_params=None, date_params=Non
     # to_timestamp('2022-10-01 00:00:00','掩码') 能解析;magic 预编译绑定把日期参数当
     # Timestamp 对象传入 → to_timestamp(timestamp,掩码) 函数不存在 → 0 行(真机实证)。
     # 参数本就是日期(或可隐式转),去掉转换函数直接比较 col between $p and $q 即可(PG/Oracle 均可)。
+    # (现由 _quoted_param_prepass 把 to_timestamp('${p}','掩码') 改成
+    #  to_timestamp(${formatDate($p,"模式")},'掩码'),这里只剩源码本就裸写 to_timestamp(${p},..) 的
+    #  日期参数一种情形。非日期参数是字符串,保留 to_timestamp 才对。)
     out = re.sub(
-        r"(?i)\bto_(?:timestamp|date)\s*\(\s*(\$[\w一-鿿]+)\s*,\s*'[^']*'\s*\)",
-        r"\1", out)
+        r"(?i)\bto_(?:timestamp|date)\s*\(\s*\$([\w一-鿿]+)\s*,\s*'[^']*'\s*\)",
+        lambda m: ("$" + m.group(1)) if m.group(1) in _dp else m.group(0), out)
     # 主 SQL 里的裸参 $name 先统一回包成 ${$name}:下面几条规则(列选择型参数、IN 守卫、
     # ORDER BY 内联)都按 ${$name} 形态匹配。全部规则跑完后,再由 _unwrap_simple_params()
     # 把「主 SQL 里剩下的单一参数」还原成裸参 $name(见函数末尾)。
@@ -804,6 +1194,11 @@ def translate_sql(sql, ident_params=None, prequoted_params=None, date_params=Non
 
     def _in_guard(m):
         p = m.group(1)
+        if p in (multi_params or ()):
+            # 多选参数运行时是 List:直接 $p 内联会得 ArrayList.toString「[a, b]」
+            # → syntax error at or near "["(真机:ICU患者收治率、CwTj_YiJiKsGzl)。
+            return ('in (#{isEmpty($%s) || $%s.join("\',\'") == \'\' ? "null" : '
+                    '"\'" + $%s.join("\',\'") + "\'"})' % (p, p, p))
         # 预格式化参数('4734','25301')与「帆软源码里本就没加引号」的列表参数(fenlei="1,2")
         # 都是 SQL 列表文本,原样内联;只有源码写成 in ('${p}') 的单值参数才补引号。
         if p in _pq or p in _raw_in:
@@ -811,14 +1206,30 @@ def translate_sql(sql, ident_params=None, prequoted_params=None, date_params=Non
         return 'in (#{isEmpty($%s) || $%s == \'\' ? "null" : "\'" + $%s + "\'"})' % (p, p, p)
 
     out = re.sub(r"(?i)\bin\s*\(\s*\$\{\$([A-Za-z_一-鿿][\w一-鿿]*)\}\s*\)", _in_guard, out)
+    # LIMIT/OFFSET 参数:帆软内联数字,magic 绑成 varchar → argument of LIMIT must be type bigint
+    out = re.sub(r"(?i)\b(limit|offset)\s+\$\{\$([A-Za-z_一-鿿][\w一-鿿]*)\}",
+                 r"\1 CAST(${$\2} AS bigint)", out)
     # ⭐ORDER BY 里的参数永远是列名/排序方向(asc/desc),不是值。绑定 ? 在排序方向位非法
     # (真机:国家医保住院医疗费用结算表 `order by col ${$a}` 报 syntax error near "$4")。
     # 把 ORDER BY 子句(到下一个 ) 或语句尾)内的 ${$p} 改 #{$p} 内联;空值→无方向(默认升序)。
-    out = re.sub(
-        r"(?is)\border\s+by\b[^)]*",
-        lambda m: re.sub(r"\$\{\$([A-Za-z_一-鿿][\w一-鿿]*)\}", r"#{$\1}", m.group(0)),
-        out)
-    return _unwrap_simple_params(out), unknown
+    # ⚠️区间止于下一个 ) 或子句关键字;且只改「独立成项」的参数(紧跟 by / , / 列名之后,
+    # 其后是 , ) asc desc 或结尾)。旧实现区间是 [^)]* 会跨过 union 吞到后面的 where,把
+    # between ${$d} 也改成 #{$d} → 日期对象内联成 Mon Nov 12…→ syntax error near "Nov"
+    # (真机:术前讨论率、血液透析血常规患者 coalesce(x, ${$d} - interval ..) 也被误改)。
+    def _ob(m):
+        def _one(mm):
+            if mm.group(3) in _dp:
+                return mm.group(0)
+            return mm.group(1) + mm.group(2) + "#{$%s}" % mm.group(3)
+        return re.sub(r"(?i)(\bby|,|[\w\])\"一-鿿])(\s*)\$\{\$([A-Za-z_一-鿿][\w一-鿿]*)\}"
+                      r"(?=\s*(?:,|\)|$|asc\b|desc\b|nulls\b|limit\b))", _one, m.group(0))
+    out = re.sub(r"(?is)\border\s+by\b(?:(?!\b(?:where|union|from|select|limit|having|join)\b)[^)])*",
+                 _ob, out)
+    # 关键字与占位符粘连(帆软 LIKE'%${k}%' 去引号后成 LIKE${...})→ 补空格
+    out = re.sub(r"(?i)\b(like|and|or|between|in|is|then|else|when|not)(?=\$\{)", r"\1 ", out)
+    out = _unwrap_simple_params(out)
+    out = re.sub(r"\x05(\d+)\x05", lambda m: _stash05[int(m.group(1))], out)
+    return _neutralize_comment_fragments(out), unknown
 
 
 def _unwrap_simple_params(sql):
@@ -837,7 +1248,9 @@ def _unwrap_simple_params(sql):
     frags = []
     sql = re.sub(r"#\{(?:[^{}]|\$\{[^{}]*\})*\}",
                  lambda m: frags.append(m.group(0)) or "\x04%d\x04" % (len(frags) - 1), sql)
-    sql = re.sub(r"\$\{\$([A-Za-z_一-鿿][\w一-鿿]*)\}", r"$\1", sql)
+    # ⚠️后面紧跟标识符字符时不还原:'${a}'and → ${$a}and → $aand 会把后文吞进变量名
+    # (真机:CwTj_ZhongYaoKfTj「between $startTimeand $endTime」)。
+    sql = re.sub(r"\$\{\$([A-Za-z_一-鿿][\w一-鿿]*)\}(?![\w一-鿿])", r"$\1", sql)
     return re.sub(r"\x04(\d+)\x04", lambda m: frags[int(m.group(1))], sql)
 
 
@@ -955,19 +1368,53 @@ def _collect_datasets(root):
     return datasets
 
 
+_CDATA_RE = re.compile(r"<!\[CDATA\[(.*?)\]\]>", re.S)
+
+
+def _fr_decode_cdata(raw):
+    """帆软 CDATA 转义还原:部分帆软版本把 CDATA 正文里的每个 `]` 写成 `]A`
+    (防正文出现 `]]>` 提前闭合;原文的 `]A` 则写成 `]AA`)。帆软设计器读入时还原,
+    我们不还原就会把 `xpath(...)[1]A::text`、`ARRAY[...]A`、正则 `[0-9]A+` 原样带进 SQL
+    → PG 报 syntax error at or near "A" / "::" / "||"(真机:永四 200+ 张报表)。
+    仅当该文件 CDATA 正文里的 `]` **全部**后跟 `A` 时才判定为此编码并还原,
+    避免误伤未转义的文件(正文里本来就有 `]A` 字样的极少数情况)。"""
+    bodies = _CDATA_RE.findall(raw)
+    total = sum(b.count("]") for b in bodies)
+    if not total:
+        return raw
+    encoded = sum(b.count("]A") for b in bodies)
+    if encoded != total:
+        return raw
+    return _CDATA_RE.sub(lambda m: "<![CDATA[" + m.group(1).replace("]A", "]") + "]]>", raw)
+
+
+def fr_parse(path):
+    """读帆软模板(.cpt/.frm/服务器数据集 xml)为 ElementTree,先还原 CDATA 的 `]A` 转义。"""
+    with open(path, "rb") as f:
+        data = f.read()
+    try:
+        raw = data.decode("utf-8")
+    except UnicodeDecodeError:
+        return ET.parse(path)
+    raw = _fr_decode_cdata(raw)
+    # 去掉 XML 声明里的 encoding(已是 str),否则 fromstring 对含 encoding 的 str 报错
+    raw = re.sub(r"^\ufeff?<\?xml[^>]*\?>", "", raw, count=1)
+    return ET.ElementTree(ET.fromstring(raw))
+
+
 def load_server_datasets(path):
     """读帆软「服务器数据集」文件(WEB-INF/resources/datasource.xml 一类),返回 {名: 数据集}。
     .cpt 里 NameTableData 只存名字引用服务器数据集,定义不在模板内;提供此文件后即可解析。"""
     if not path or not os.path.exists(path):
         return {}
     try:
-        return _collect_datasets(ET.parse(path).getroot())
+        return _collect_datasets(fr_parse(path).getroot())
     except ET.ParseError:
         return {}
 
 
 def parse_cpt(path, server_datasets=None):
-    tree = ET.parse(path)
+    tree = fr_parse(path)
     root = tree.getroot()  # WorkBook
 
     # ---- 样式表(workbook 级,s="N" 引用其第 N 个 Style) ----
@@ -2387,7 +2834,14 @@ def _parse_rich_text(O, cell, issues):
         else:
             e, unk = translate_expression(v.lstrip("=").strip())
             unknown |= unk
-            out.append(e if re.fullmatch(r"[$\w.]+(\(\))?", e) else "(%s)" % e)
+            if re.fullmatch(r"[$\w.]+(\(\))?", e):
+                out.append(e)
+            elif re.match(r"\s*if\s*\(", e) and _balanced_args(e, e.index("("))[1] == len(e):
+                # 整段就是一个 if(...) 调用:本身是原子,不能再包括号——magic 解析器把
+                # `(if` 当 lambda 形参报「变量名不能定义为关键字」(真机:挂号信息查询 D5)
+                out.append(e)
+            else:
+                out.append(_strip_paren_around_if("(%s)" % e))
     if out and out[0].startswith("$") and len(out) > 1:
         out.insert(0, '""')            # 首项是参数时先接空串,确保按字符串拼接
     expr = guard_zero_division(" + ".join(out))
@@ -2992,11 +3446,26 @@ def _emit_report_head(out, sm, cfg, issues, used_ds):
                     if m.get("datatype") in _DATE_PAT}
     # 列选择型参数集合(值为 a.记账日期 这类列引用):SQL 翻译时这些参数走 #{} 内联而非 ${} 绑定。
     ident_params = set()
-    _qmeta = _meta_all
+    # 默认值来源:查询控件(meta) 优先,其次报表参数声明(sm["params"],无控件的 URL 参数也在这里)
+    _qmeta = {}
+    for _pn, _pv in (sm.get("params") or {}).items():
+        _qmeta[_pn] = {"default": _pv}
+    for _pn, _pm in _meta_all.items():
+        _m2 = dict(_pm)
+        if _m2.get("default") in (None, "") and _qmeta.get(_pn, {}).get("default"):
+            _m2["default"] = _qmeta[_pn]["default"]
+        _qmeta[_pn] = _m2
     for _pn, _pm in _qmeta.items():
         _dv = _pm.get("default")
-        if _dv and _COL_IDENT.match(str(_dv)):
+        if _dv and _COL_IDENT.match(str(_dv).strip()):
             ident_params.add(_pn)
+    # 值本身是 SQL 片段的参数(默认值 `is not null` / `in (1,2)` / `= '1'` …)→ SQL 里整体 #{} 内联
+    frag_params = set()
+    for _pn, _pm in _qmeta.items():
+        _dv = str(_pm.get("default") or "")
+        if re.match(r"(?is)\s*(?:is\s+(?:not\s+)?null\b|(?:not\s+)?in\s*\(|(?:not\s+)?like\s|"
+                    r"between\s|[=<>]|!=)", _dv):
+            frag_params.add(_pn)
     for _c in _comps_all:
         _pn = _c.get("parameterName") or _c.get("name")
         _opts = (_c.get("props") or {}).get("customBinding") or []
@@ -3008,14 +3477,22 @@ def _emit_report_head(out, sm, cfg, issues, used_ds):
     # parameter emit 处一并去掉)。真机:ICU患者收治率 keshi 默认 \'4734\',\'25301\'。
     prequoted_params = set()
     for _pn, _pm in _qmeta.items():
-        _dv = str(_pm.get("default") or "").replace("\\'", "'")
-        if "'" in _dv:
+        _dv = str(_pm.get("default") or "").replace("\\'", "'").strip()
+        # 只有「首尾都带引号」的才是预格式化列表('4734','25301');1','-1 这种是帆软多选控件
+        # 分隔符为 ',' 的取值,源码里写成 in ('${p}'),仍需补首尾引号(真机:MzTjBb_MenZhenFyMxCx)。
+        if len(_dv) >= 2 and _dv.startswith("'") and _dv.endswith("'"):
             prequoted_params.add(_pn)
 
     # 日期类参数集合(用于 SQL 比较值内联时排除):①datatype Date/DateTime(date_fmt)
     # ②查询组件是日期/时间选择器(运行时传 Date 对象,内联会得 Date.toString 非法串)。
     # 字符串型选择器(radio/select,如 riqi=计费日期、endTime=某选项)值是字符串,可安全内联。
     date_param_set = set(date_fmt)
+    # 无控件、仅报表参数声明的:输出时按默认值形如日期推断成 Date(见下方 parameter 输出),
+    # 运行期同样是 Date 对象,内联/拼串时要 formatDate(真机:时间段住院病人查询 starttime)
+    for _pn, _pv in (sm.get("params") or {}).items():
+        if not (_meta_all.get(_pn) or {}).get("datatype") and re.search(r"\d{4}-\d{2}-\d{2}", str(_pv or "")):
+            date_param_set.add(_pn)
+            date_fmt.setdefault(_pn, "yyyy-MM-dd")
     for _c in _comps_all:
         if (_c.get("type") or "") in ("date", "datetime", "time", "daterange", "datetimerange"):
             _dn = _c.get("parameterName") or _c.get("name")
@@ -3031,6 +3508,10 @@ def _emit_report_head(out, sm, cfg, issues, used_ds):
             _mn = _c.get("parameterName") or _c.get("name")
             if _mn:
                 multi_param_set.add(_mn)
+    # 隐藏控件只留了参数声明(datatype=List),同样是运行时 List
+    for _pn, _pm in _meta_all.items():
+        if str(_pm.get("datatype") or "") == "List":
+            multi_param_set.add(_pn)
 
     # 布尔参数集合(帆软单 CheckBox → magic switch,运行时是 java Boolean):
     # 既不能内联成 'true' 字面量,也不能当多选走 .join。以参数声明的 datatype 为准
@@ -3074,7 +3555,8 @@ def _emit_report_head(out, sm, cfg, issues, used_ds):
         out.append('    <dataset %s>' % da)
         sql_out, sql_unk = translate_sql(ds.get("sql") or "", ident_params,
                                          prequoted_params, date_param_set,
-                                         multi_param_set, bool_param_set)
+                                         multi_param_set, bool_param_set,
+                                         date_fmt=date_fmt, frag_params=frag_params)
         out.append('        <sql>%s</sql>' % cdata(sql_out))
         for sev, pr in sql_lint(ds.get("sql") or ""):
             issues.append(Issue(sev, "数据集:" + dsName, "原 SQL " + pr))
@@ -3120,6 +3602,12 @@ def _emit_report_head(out, sm, cfg, issues, used_ds):
         # 去帆软对默认值里引号的反斜杠转义(\'4734\' → '4734'):magic 运行期把默认值原样
         # 内联进 SQL,残留的 \' 会变 in ('\'4734\'') 触发 syntax error(真机:ICU患者收治率)。
         dv = str(dv or "").replace("\\'", "'").replace('\\"', '"')
+        if dt == "List" and not m.get("default_expr") and "'" in dv:
+            # List 参数默认值由后端 ListValueParser 按逗号切分;帆软多选控件的取值形如
+            # 门诊','住院 / '4734' / 1','2','3(分隔符 ',' 、首尾引号由 SQL 补),原样给
+            # 会切出 门诊' / '住院 这种带引号的元素。规整成纯逗号列表。
+            dv = ",".join(x.strip().strip("'") for x in re.split(r"'\s*,\s*'|,", dv)
+                          if x.strip().strip("'"))
         pa = ('xmlns="" id="p_%d" name="%s" datatype="%s" defaultValue="%s"'
               % (pi, html.escape(pn, quote=True), dt,
                  html.escape(dv, quote=True)))
@@ -3191,6 +3679,57 @@ def _emit_embeds(out, embeds, cfg):
                               r'\g<1>%s_\g<2>_' % e["id"], ln))
         out.append('        </embeddedReport>')
     out.append('    </embeddedReports>')
+
+
+def _col_letters(ci):
+    """1-based 列号 → 列字母(1→A, 27→AA)。"""
+    out = ""
+    while ci > 0:
+        ci, r = divmod(ci - 1, 26)
+        out = chr(65 + r) + out
+    return out
+
+
+def _redirect_covered_refs(xml_text):
+    """表达式里引用了「被合并单元格覆盖的格」(如 A1 合并 A1:D1,条件里写 D1)→ 改指向合并格左上角。
+
+    帆软设计器里这些坐标仍可写进公式(按合并区取值);sight-report 只保留合并区左上角那一格,
+    其余是占位格,运行时报「单元格【A1】中表达式引用的目标单元格【D1】不存在」整张报表打不开
+    (真机:CwTj_HeBoBiaoZs、危急值、yK_YaoPinXhYlTjb 等 9 张)。按 sheet / 内嵌报表分段处理。"""
+    bounds = [m.start() for m in re.finditer(r"<sheet |<embeddedReport |</embeddedReport>", xml_text)]
+    cuts = [0] + bounds + [len(xml_text)]
+    segs = [xml_text[cuts[i]:cuts[i + 1]] for i in range(len(cuts) - 1)]
+    cell_re = re.compile(r'<cell [^>]*\brow="(\d+)" col="(\d+)" name="([A-Z]+\d+)" colspan="(\d+)" rowspan="(\d+)"')
+    tok = re.compile(r"(?<![\w$.@])([A-Z]{1,3}\d+)(?![\w(\[])")
+
+    def _fix_expr(expr, cmap):
+        strings = []
+        t = re.sub(r"'(?:[^'\\]|\\.)*'|\"(?:[^\"\\]|\\.)*\"",
+                   lambda m: strings.append(m.group(0)) or "\x00%d\x00" % (len(strings) - 1), expr)
+        t = tok.sub(lambda m: cmap.get(m.group(1), m.group(1)), t)
+        return re.sub(r"\x00(\d+)\x00", lambda m: strings[int(m.group(1))], t)
+
+    out = []
+    for seg in segs:
+        cmap = {}
+        for m in cell_re.finditer(seg):
+            r, c, nm, cs, rs = int(m.group(1)), int(m.group(2)), m.group(3), int(m.group(4)), int(m.group(5))
+            if cs >= 1 and rs >= 1 and cs * rs > 1:
+                for rr in range(r, r + rs):
+                    for cc in range(c, c + cs):
+                        if (rr, cc) != (r, c):
+                            cmap["%s%d" % (_col_letters(cc), rr)] = nm
+        if cmap:
+            seg = re.sub(r"(<expressionContent[^>]*><!\[CDATA\[)(.*?)(\]\]>)",
+                         lambda m: m.group(1) + _fix_expr(m.group(2), cmap) + m.group(3), seg, flags=re.S)
+            seg = re.sub(r'(\bexpression=")([^"]*)(")',
+                         lambda m: m.group(1) + html.escape(_fix_expr(html.unescape(m.group(2)), cmap), quote=True)
+                         + m.group(3), seg)
+            seg = re.sub(r'(<parameter [^>]*\bvalue=")([^"]*)("[^>]*isExpression="true")',
+                         lambda m: m.group(1) + html.escape(_fix_expr(html.unescape(m.group(2)), cmap), quote=True)
+                         + m.group(3), seg)
+        out.append(seg)
+    return "".join(out)
 
 
 def map_to_xml(sm, cfg, issues):
@@ -3785,7 +4324,7 @@ def convert_one(path, outdir, cfg, subdir="", overwrite="overwrite"):
                    "datasets": model["datasets"], "params": params, "query": query,
                    "embeds": model["embeds"], "embed_used": model["embed_used"],
                    "query_extra": model["query_extra"]}
-        xml_text = map_to_xml_multi(head_sm, processed, cfg, combined)
+        xml_text = _redirect_covered_refs(map_to_xml_multi(head_sm, processed, cfg, combined))
         title = "%s(多页签 · %d 个 sheet)" % (model["name"], len(sheets))
         report, n_manual, n_deg, n_cells = write_report(
             title, {"cells": report_cells, "params": params}, combined)
@@ -3833,7 +4372,7 @@ def convert_one(path, outdir, cfg, subdir="", overwrite="overwrite"):
               "params": params, "query": query, "report_name": report_name,
               "embeds": model["embeds"], "embed_used": model["embed_used"],
               "query_extra": model["query_extra"]}
-        xml_text = map_to_xml(sm, cfg, issues)
+        xml_text = _redirect_covered_refs(map_to_xml(sm, cfg, issues))
         title = (_sh if _redun
                  else ("%s / %s" % (model["name"], _sh) if multi else model["name"]))
         report, n_manual, n_deg, n_cells = write_report(title, sm, issues)
@@ -3982,7 +4521,7 @@ def unsupported_frm_row(path, sub=""):
     base = os.path.splitext(os.path.basename(path))[0]
     n_chart = n_table = 0
     try:
-        for e in ET.parse(path).getroot().iter():
+        for e in fr_parse(path).getroot().iter():
             c = e.get("class", "")
             if c.endswith("form.ui.ChartEditor"):
                 n_chart += 1

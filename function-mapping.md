@@ -55,7 +55,7 @@ magic 端函数语义以 `ai-docs/expression-syntax-guide.md`(MagicScript 引擎
 | 帆软 | 频次 | 帆软语义 | magic 对应 | 决策 | 参数核对 |
 |---|---|---|---|---|---|
 | `CONCATENATE(...)` | 8648 | 拼接 | `concat(...)` | 改名 | ✅ 均忽略 null,一致 |
-| `LEN(s)` | 17 | 长度 | `length(s)` | 改名 | ✅ |
+| `LEN(s)` | 17 | 长度 | `length(s)`;**与 0 比较时**(`LEN(x)=0` / `>0` / `<>0`)改判空 `(isEmpty(x) \|\| x == '')` / `!(…)`(magic `length` 只认字符串,List/数字会「找不到函数」) | 改名/重写 | ✅ |
 | `LEFT/RIGHT(s,n)` | — | 左/右截取 | `left/right(s,n)` | 直接 | ✅ 参数一致 |
 | `REPLACE(s,old,new)` | 12 | (本库)查找替换 | `replace(s,old,new)` | 直接 | ⚠️ magic `old` 按**正则**解释;含正则元字符 `. * ? [ ]` 时需复核。注:帆软标准 REPLACE 为按位置 4 参替换,本库未出现 |
 
@@ -233,3 +233,18 @@ magic `count(v1,v2,...)` 文档定义为「参数个数(含 null)」。对 `coun
    # 全库覆盖率统计见 README「质量保障」
    ```
 6. **务必同步更新本表**,保持「代码映射 ↔ 文档依据」一致。
+
+## 永四批量体检补充(2026-11-12)
+
+| 帆软写法 | → magic | 说明 |
+|---|---|---|
+| `ARRAY(a,b,…)` | `[a, b, …]` | 数组字面量 |
+| `VALUE(ds, col)` / `VALUE(ds, col, n)` | `dataset(ds, col)` / `arrayGet(dataset(ds, col), n - 1)` | 取数据集列值 |
+| `DATEINMONTH(YEAR(),±1)` | `yearStart(now())` / `yearEnd(now())` | 帆软把年份当日期,本意是今年首/末日 |
+| `YEAR/MONTH/DAY(TODAY())` | `year(now())` 等 | `date()` 在 magic 是字符串 |
+| `$$参数` | `$参数` | 帆软多写一个 `$` 也能取到参数(`$$$` 自引用不动) |
+| 字符串外的全角 `（），` | 半角 | 帆软容错,magic 报 Unknown token |
+| `(IF(…))` / 富文本 `${=IF(…)}` | 去掉外层括号 | magic 把 `(if` 当 lambda 形参,报「变量名不能定义为关键字」 |
+| `IF(c,a,b) + x`(整段以 IF 开头还接运算) | `((c) ? (a) : (b)) + x` | magic 语句级 if(…) 后接运算会编译失败(Operand stack underflow) |
+| `K4[!0;!0]` | `K4[!0]` | magic 只支持 `[!0]` |
+| 公式末尾多余的 `}` | 去掉 | 源模板笔误 |

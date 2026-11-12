@@ -1454,7 +1454,7 @@ def convert_frm(path, outdir, cfg, subdir="", overwrite="overwrite"):
     C._PUBLIC["on"] = cfg.get("assume_public_datasets", True)
     C._PUBLIC["report"] = rel
     try:
-        root = ET.parse(path).getroot()
+        root = C.fr_parse(path).getroot()
     except ET.ParseError as e:
         return [{"name": rel, "ok": False, "error": "XML 解析失败:%s" % e}]
     issues = []
